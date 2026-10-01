@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{TITLE}}</title>
+<style>
+:root{--primary:#0ea5e9;--bg:#f1f5f9;--card:#ffffff;--text:#0f172a;--muted:#64748b;--border:#e2e8f0}
+*{box-sizing:border-box}body{margin:0;font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text)}
+.wrap{max-width:1000px;margin:0 auto;padding:24px}
+h1{margin:0 0 4px;font-size:24px}.sub{color:var(--muted);margin:0 0 20px}
+.grid{display:grid;grid-template-columns:340px 1fr;gap:16px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:18px}
+label{display:block;font-size:13px;color:var(--muted);margin:10px 0 4px}
+input,select{width:100%;font:inherit;padding:9px 10px;border:1px solid var(--border);border-radius:8px;background:var(--card);color:var(--text)}
+.seg{display:flex;gap:6px}.seg button{flex:1}
+button{font:inherit;padding:9px 12px;border-radius:8px;border:1px solid var(--border);background:var(--card);color:var(--text);cursor:pointer}
+button.on,button.primary{background:var(--primary);border-color:var(--primary);color:#fff}
+.kpis{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:14px}
+.kpi{background:color-mix(in srgb,var(--primary) 8%,var(--card));border-radius:10px;padding:12px}.kpi b{display:block;font-size:20px;margin-top:4px}
+table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:6px 8px;border-bottom:1px solid var(--border);text-align:right}th:first-child,td:first-child{text-align:left}
+.cmp{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:12px 0}.save{color:#16a34a;font-weight:700}
+canvas{width:100%;height:180px}.history li{cursor:pointer;color:var(--primary);margin:4px 0}
+@media(max-width:800px){.grid{grid-template-columns:1fr}.kpis{grid-template-columns:1fr}}
+</style>
+</head>
+<body><div class="wrap">
+<h1 data-title>{{TITLE}}</h1><p class="sub">{{SUBTITLE}}</p>
+<div class="grid">
+ <div class="card">
+  <label>贷款总额（万元）</label><input id="amount" type="number" value="100" min="1">
+  <label>贷款年限（年）</label><input id="years" type="number" value="30" min="1" max="40">
+  <label>年利率（%）</label><input id="rate" type="number" value="3.1" step="0.01">
+  <label>还款方式</label><div class="seg"><button data-m="ep" class="on">等额本息</button><button data-m="pp">等额本金</button></div>
+  <label>提前还款：第几个月</label><input id="preMonth" type="number" value="36" min="1">
+  <label>提前还款金额（万元）</label><input id="preAmt" type="number" value="20" min="0">
+  <label>提前还款后</label><select id="preMode"><option value="term">月供不变，缩短年限</option><option value="pay">年限不变，减少月供</option></select>
+  <p><button class="primary" id="saveBtn" style="width:100%">保存本次方案</button></p>
+  <div><b style="font-size:13px">历史方案</b><ul class="history" id="history"></ul></div>
+ </div>
+ <div class="card">
+  <div class="kpis"><div class="kpi">首月月供<b id="k1">-</b></div><div class="kpi">总利息<b id="k2">-</b></div><div class="kpi">还款总额<b id="k3">-</b></div></div>
+  <canvas id="chart" width="600" height="180"></canvas>
+  <h3 style="margin:14px 0 6px">提前还款对比</h3>
+  <div class="cmp" id="cmp"></div>
+  <h3 style="margin:14px 0 6px">还款计划（前 24 期）</h3>
+  <table><thead><tr><th>期数</th><th>月供</th><th>本金</th><th>利息</th><th>剩余本金</th></tr></thead><tbody id="tbody"></tbody></table>
+ </div>
+</div></div>
+<script>
+const KEY='mortgage-{{SLUG}}';let mode='ep';
+const $=s=>document.querySelector(s);const fmt=n=>'¥'+Math.round(n).toLocaleString('zh-CN');
+function schedule(P,n,r,m,pre){
+  const rows=[];let bal=P,i=r/12/100,k=1,pay=m==='ep'?(i?P*i*Math.pow(1+i,n)/(Math.pow(1+i,n)-1):P/n):0,left=n;
+  while(bal>0.01&&k<=600){
+    const interest=bal*i;let principal;
+    if(m==='ep'){principal=Math.min(pay-interest,bal)}else{principal=Math.min(P/n,bal)}
+    if(m==='pp'&&pre&&k>pre.month&&pre.mode==='pay')principal=Math.min(pre.base/(n-pre.month),bal);
+    bal-=principal;rows.push({k,pay:principal+interest,principal,interest,bal:Math.max(bal,0)});
+    if(pre&&k===pre.month&&pre.amount>0){
+      const a=Math.min(pre.amount,bal);bal-=a;rows[rows.length-1].extra=a;left=n-k;
+      if(m==='ep'&&pre.mode==='pay'&&bal>0)pay=i?bal*i*Math.pow(1+i,left)/(Math.pow(1+i,left)-1):bal/left;
+      if(m==='pp')pre.base=bal;
+    }
+    k++;
+  }
+  return rows;
+}
+const sum=(rows,f)=>rows.reduce((s,r)=>s+r[f],0);
+function calc(){
+  const P=+$('#amount').value*1e4,n=+$('#years').value*12,r=+$('#rate').value;
+  if(!(P>0&&n>0&&r>=0))return;
+  const base=schedule(P,n,r,mode);
+  const pre={month:+$('#preMonth').value,amount:+$('#preAmt').value*1e4,mode:$('#preMode').value};
+  const withPre=schedule(P,n,r,mode,pre);
+  $('#k1').textContent=fmt(base[0].pay);$('#k2').textContent=fmt(sum(base,'interest'));$('#k3').textContent=fmt(sum(base,'pay'));
+  const saved=sum(base,'interest')-sum(withPre,'interest');
+  $('#cmp').innerHTML=`<div class="kpi">不提前还款<b>${fmt(sum(base,'interest'))}</b><small>利息 · 共 ${base.length} 期</small></div><div class="kpi">提前还款 ${pre.amount/1e4} 万<b>${fmt(sum(withPre,'interest'))}</b><small>利息 · 共 ${withPre.length} 期</small></div><div style="grid-column:span 2">预计节省利息：<span class="save">${fmt(saved)}</span>${pre.mode==='term'?`，提前 ${base.length-withPre.length} 个月还清`:`，之后月供约 ${fmt((withPre[pre.month]||{pay:0}).pay)}`}</div>`;
+  $('#tbody').innerHTML=base.slice(0,24).map(x=>`<tr><td>${x.k}</td><td>${fmt(x.pay)}</td><td>${fmt(x.principal)}</td><td>${fmt(x.interest)}</td><td>${fmt(x.bal)}</td></tr>`).join('');
+  draw(base,withPre);
+}
+function draw(a,b){
+  const c=$('#chart'),g=c.getContext('2d'),W=c.width,H=c.height;g.clearRect(0,0,W,H);
+  const max=a[0].bal+a[0].principal;const css=getComputedStyle(document.documentElement);
+  [[a,'#94a3b8'],[b,css.getPropertyValue('--primary').trim()||'#0ea5e9']].forEach(([rows,color])=>{
+    g.strokeStyle=color;g.lineWidth=2;g.beginPath();
+    rows.forEach((r,i)=>{const x=i/(a.length-1)*W,y=H-r.bal/max*(H-10);i?g.lineTo(x,y):g.moveTo(x,y)});g.stroke();
+  });
+  g.fillStyle='#64748b';g.font='12px sans-serif';g.fillText('剩余本金：灰=原方案  彩=提前还款',8,14);
+}
+function loadHistory(){
+  const list=JSON.parse(localStorage.getItem(KEY)||'[]');
+  $('#history').innerHTML=list.length?list.map((h,i)=>`<li data-i="${i}">${h.name}</li>`).join(''):'<small style="color:#94a3b8">暂无，点击上方按钮保存</small>';
+  $('#history').querySelectorAll('li').forEach(li=>li.onclick=()=>{const h=list[li.dataset.i];Object.entries(h.v).forEach(([k,v])=>$('#'+k).value=v);setMode(h.mode)});
+}
+function setMode(m){mode=m;document.querySelectorAll('[data-m]').forEach(b=>b.classList.toggle('on',b.dataset.m===m));calc()}
+document.querySelectorAll('[data-m]').forEach(b=>b.onclick=()=>setMode(b.dataset.m));
+document.querySelectorAll('input,select').forEach(el=>el.addEventListener('input',calc));
+$('#saveBtn').onclick=()=>{
+  const ids=['amount','years','rate','preMonth','preAmt','preMode'];const v={};ids.forEach(k=>v[k]=$('#'+k).value);
+  const list=JSON.parse(localStorage.getItem(KEY)||'[]');
+  list.unshift({name:`${v.amount}万 · ${v.years}年 · ${v.rate}% · ${mode==='ep'?'等额本息':'等额本金'}`,v,mode});
+  localStorage.setItem(KEY,JSON.stringify(list.slice(0,8)));loadHistory();
+};
+loadHistory();calc();
+</script>
+</body>
+</html>

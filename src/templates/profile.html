@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{TITLE}}</title>
+<style>
+:root{--primary:#7c3aed;--bg:#faf7ff;--card:#ffffff;--text:#1e1b2e;--muted:#6b6880;--border:#ebe5f7}
+*{box-sizing:border-box}body{margin:0;font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text);line-height:1.6}
+.hero{background:linear-gradient(135deg,var(--primary),color-mix(in srgb,var(--primary) 50%,#ec4899));color:#fff;padding:56px 24px 80px;text-align:center}
+.avatar{width:96px;height:96px;border-radius:50%;background:rgba(255,255,255,.25);display:grid;place-items:center;font-size:40px;margin:0 auto 14px;border:3px solid rgba(255,255,255,.6)}
+.hero h1{margin:0;font-size:32px}.hero p{margin:6px 0 0;opacity:.9}
+.top{position:fixed;top:12px;right:12px;display:flex;gap:8px;z-index:5}
+.top button{background:rgba(255,255,255,.9);border:none;border-radius:999px;padding:6px 14px;cursor:pointer;font:inherit;font-size:13px}
+main{max-width:860px;margin:-48px auto 40px;padding:0 16px;display:grid;gap:16px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:22px;box-shadow:0 6px 24px rgba(80,40,160,.06)}
+.card h2{margin:0 0 12px;font-size:18px}
+.tags{display:flex;flex-wrap:wrap;gap:8px}.tag{background:color-mix(in srgb,var(--primary) 12%,var(--card));color:var(--primary);padding:4px 12px;border-radius:999px;font-size:14px}
+.tag .x{margin-left:6px;cursor:pointer;display:none}.editing .tag .x{display:inline}
+.add{display:none;gap:8px;margin-top:10px}.editing .add{display:flex}
+input,textarea{font:inherit;padding:9px 10px;border:1px solid var(--border);border-radius:8px;width:100%;background:var(--card);color:var(--text)}
+button.primary{background:var(--primary);color:#fff;border:none;border-radius:8px;padding:9px 16px;cursor:pointer;font:inherit;white-space:nowrap}
+.editing [data-edit]{outline:2px dashed color-mix(in srgb,var(--primary) 50%,transparent);outline-offset:4px;border-radius:4px}
+.contact{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}.contact div{padding:10px;border-radius:10px;background:var(--bg)}
+.msgs{margin-top:12px;display:grid;gap:8px}.msg{padding:10px;border-radius:10px;background:var(--bg);font-size:14px}.msg small{color:var(--muted)}
+form{display:grid;gap:8px}
+</style>
+</head>
+<body>
+<div class="top"><button id="editBtn">✏️ 编辑模式</button></div>
+<section class="hero">
+  <div class="avatar" id="avatar">{{INITIAL}}</div>
+  <h1 data-edit="name" data-title>{{NAME}}</h1>
+  <p data-edit="role">{{ROLE}}</p>
+</section>
+<main>
+  <div class="card"><h2>关于我</h2><p data-edit="about">{{ABOUT}}</p></div>
+  <div class="card"><h2>技能</h2><div class="tags" id="skills"></div>
+    <div class="add"><input id="skillIn" placeholder="添加技能，回车确认"><button class="primary" id="skillAdd">添加</button></div></div>
+  <div class="card"><h2>联系方式</h2><div class="contact">
+    <div>📧 <span data-edit="email">{{EMAIL}}</span></div><div>📍 <span data-edit="city">{{CITY}}</span></div><div>🔗 <span data-edit="link">{{LINK}}</span></div></div></div>
+  <div class="card"><h2>留言板</h2>
+    <form id="msgForm"><input name="who" placeholder="你的名字" required maxlength="20"><textarea name="text" rows="3" placeholder="想对我说点什么…" required maxlength="300"></textarea><button class="primary">发送留言</button></form>
+    <div class="msgs" id="msgs"></div></div>
+</main>
+<script>
+const KEY='profile-{{SLUG}}';
+const $=s=>document.querySelector(s);
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const state=JSON.parse(localStorage.getItem(KEY)||'null')||{fields:{},skills:{{SKILLS_JSON}},msgs:[]};
+const save=()=>localStorage.setItem(KEY,JSON.stringify(state));
+document.querySelectorAll('[data-edit]').forEach(el=>{const k=el.dataset.edit;if(state.fields[k])el.textContent=state.fields[k];
+  el.addEventListener('input',()=>{state.fields[k]=el.textContent.trim();if(k==='name')$('#avatar').textContent=el.textContent.trim().slice(0,1);save()})});
+if(state.fields.name)$('#avatar').textContent=state.fields.name.slice(0,1);
+function renderSkills(){$('#skills').innerHTML=state.skills.map((s,i)=>`<span class="tag">${esc(s)}<span class="x" data-i="${i}">×</span></span>`).join('');
+  $('#skills').querySelectorAll('.x').forEach(x=>x.onclick=()=>{state.skills.splice(+x.dataset.i,1);save();renderSkills()})}
+function renderMsgs(){$('#msgs').innerHTML=state.msgs.length?state.msgs.map(m=>`<div class="msg"><b>${esc(m.who)}</b> <small>${m.at}</small><div>${esc(m.text)}</div></div>`).join(''):'<small style="color:#999">还没有留言</small>'}
+function addSkill(){const v=$('#skillIn').value.trim();if(v&&!state.skills.includes(v)){state.skills.push(v);save();renderSkills()}$('#skillIn').value=''}
+$('#skillAdd').onclick=addSkill;$('#skillIn').addEventListener('keydown',e=>{if(e.key==='Enter')addSkill()});
+$('#editBtn').onclick=()=>{const on=document.body.classList.toggle('editing');document.querySelectorAll('[data-edit]').forEach(el=>el.contentEditable=on);$('#editBtn').textContent=on?'✅ 完成编辑':'✏️ 编辑模式'};
+$('#msgForm').addEventListener('submit',e=>{e.preventDefault();const f=e.target;state.msgs.unshift({who:f.who.value.trim(),text:f.text.value.trim(),at:new Date().toLocaleString('zh-CN')});save();renderMsgs();f.reset()});
+renderSkills();renderMsgs();
+</script>
+</body>
+</html>

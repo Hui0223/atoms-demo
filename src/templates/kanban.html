@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{TITLE}}</title>
+<style>
+:root{--primary:#6366f1;--bg:#f5f6fb;--card:#ffffff;--text:#1f2937;--muted:#6b7280;--border:#e5e7eb;--radius:12px}
+*{box-sizing:border-box}body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text)}
+header{padding:20px 24px;display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between}
+h1{margin:0;font-size:22px}h1 small{display:block;font-size:13px;color:var(--muted);font-weight:400;margin-top:4px}
+.toolbar{display:flex;gap:8px;flex-wrap:wrap}
+input,select,button{font:inherit;border-radius:8px;border:1px solid var(--border);padding:8px 10px;background:var(--card);color:var(--text)}
+button{cursor:pointer}button.primary{background:var(--primary);border-color:var(--primary);color:#fff}
+.board{display:grid;grid-template-columns:repeat(3,minmax(240px,1fr));gap:16px;padding:0 24px 24px;overflow-x:auto}
+.col{background:color-mix(in srgb,var(--card) 70%,var(--bg));border:1px solid var(--border);border-radius:var(--radius);padding:12px;min-height:300px;transition:.15s}
+.col.over{outline:2px dashed var(--primary);outline-offset:-4px}
+.col h2{font-size:15px;margin:4px 4px 12px;display:flex;justify-content:space-between}
+.count{background:var(--primary);color:#fff;border-radius:999px;padding:0 8px;font-size:12px;line-height:20px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:10px 12px;margin-bottom:10px;cursor:grab;box-shadow:0 1px 2px rgba(0,0,0,.04)}
+.card.dragging{opacity:.4}.card .t{font-weight:600;margin-bottom:6px;word-break:break-all}
+.meta{display:flex;gap:6px;align-items:center;font-size:12px;color:var(--muted);flex-wrap:wrap}
+.pri{padding:1px 8px;border-radius:999px;color:#fff;font-size:12px}.pri.高{background:#ef4444}.pri.中{background:#f59e0b}.pri.低{background:#10b981}
+.due.overdue{color:#ef4444;font-weight:600}.actions{margin-left:auto;display:flex;gap:4px}
+.actions button{padding:2px 6px;font-size:12px;border:none;background:transparent;color:var(--muted)}.actions button:hover{color:var(--primary)}
+.stats{padding:0 24px 12px;color:var(--muted);font-size:13px}
+dialog{border:none;border-radius:14px;padding:20px;width:min(420px,92vw);background:var(--card);color:var(--text)}dialog::backdrop{background:rgba(0,0,0,.35)}
+dialog form{display:grid;gap:10px}.row{display:flex;gap:8px}.row>*{flex:1}
+.empty{color:var(--muted);font-size:13px;text-align:center;padding:20px 0}
+@media(max-width:760px){.board{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<header>
+  <h1 data-title>{{TITLE}}<small>{{SUBTITLE}}</small></h1>
+  <div class="toolbar">
+    <input id="q" placeholder="搜索任务…">
+    <select id="fp"><option value="">全部优先级</option><option>高</option><option>中</option><option>低</option></select>
+    <button class="primary" id="addBtn">+ 新建任务</button>
+  </div>
+</header>
+<div class="stats" id="stats"></div>
+<main class="board" id="board"></main>
+<dialog id="dlg"><form method="dialog" id="form">
+  <h3 id="dlgTitle" style="margin:0">新建任务</h3>
+  <input name="title" placeholder="任务标题" required maxlength="80">
+  <div class="row"><select name="priority"><option>高</option><option selected>中</option><option>低</option></select><input type="date" name="due"></div>
+  <select name="col"><option value="todo">待办</option><option value="doing">进行中</option><option value="done">已完成</option></select>
+  <div class="row"><button value="cancel" formnovalidate>取消</button><button class="primary" value="ok">保存</button></div>
+</form></dialog>
+<script>
+const KEY='kanban-{{SLUG}}';
+const COLS=[['todo','待办'],['doing','进行中'],['done','已完成']];
+let tasks=JSON.parse(localStorage.getItem(KEY)||'null')||[
+ {id:1,title:'梳理需求，拆解任务',priority:'高',due:new Date(Date.now()+864e5).toISOString().slice(0,10),col:'todo'},
+ {id:2,title:'完成首页原型',priority:'中',due:'',col:'doing'},
+ {id:3,title:'搭建项目骨架',priority:'低',due:'',col:'done'}];
+let editing=null,dragId=null;
+const $=s=>document.querySelector(s);
+const save=()=>localStorage.setItem(KEY,JSON.stringify(tasks));
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+function render(){
+  const q=$('#q').value.trim(),fp=$('#fp').value,today=new Date().toISOString().slice(0,10);
+  $('#board').innerHTML='';
+  COLS.forEach(([key,name])=>{
+    const list=tasks.filter(t=>t.col===key&&(!fp||t.priority===fp)&&(!q||t.title.includes(q)));
+    const col=document.createElement('section');col.className='col';col.dataset.col=key;
+    col.innerHTML=`<h2>${name}<span class="count">${list.length}</span></h2>`+(list.length?'':'<div class="empty">拖拽任务到这里</div>');
+    list.forEach(t=>{
+      const c=document.createElement('div');c.className='card';c.draggable=true;c.dataset.id=t.id;
+      const overdue=t.due&&t.due<today&&t.col!=='done';
+      c.innerHTML=`<div class="t">${esc(t.title)}</div><div class="meta"><span class="pri ${t.priority}">${t.priority}</span>${t.due?`<span class="due ${overdue?'overdue':''}">📅 ${t.due}${overdue?' 已逾期':''}</span>`:''}<span class="actions"><button data-act="edit">编辑</button><button data-act="del">删除</button></span></div>`;
+      c.addEventListener('dragstart',()=>{dragId=t.id;c.classList.add('dragging')});
+      c.addEventListener('dragend',()=>{c.classList.remove('dragging')});
+      c.querySelector('[data-act=edit]').onclick=()=>openDlg(t);
+      c.querySelector('[data-act=del]').onclick=()=>{if(confirm('删除该任务？')){tasks=tasks.filter(x=>x.id!==t.id);save();render()}};
+      col.appendChild(c);
+    });
+    col.addEventListener('dragover',e=>{e.preventDefault();col.classList.add('over')});
+    col.addEventListener('dragleave',()=>col.classList.remove('over'));
+    col.addEventListener('drop',e=>{
+      e.preventDefault();col.classList.remove('over');
+      const t=tasks.find(x=>x.id===dragId);if(!t)return;
+      const after=[...col.querySelectorAll('.card')].find(el=>{const r=el.getBoundingClientRect();return e.clientY<r.top+r.height/2});
+      tasks=tasks.filter(x=>x.id!==dragId);t.col=key;
+      const idx=after?tasks.findIndex(x=>x.id==after.dataset.id):tasks.length;
+      tasks.splice(idx<0?tasks.length:idx,0,t);save();render();
+    });
+    $('#board').appendChild(col);
+  });
+  const done=tasks.filter(t=>t.col==='done').length;
+  $('#stats').textContent=`共 ${tasks.length} 个任务 · 已完成 ${done} · 完成率 ${tasks.length?Math.round(done/tasks.length*100):0}%`;
+}
+function openDlg(t){
+  editing=t||null;const f=$('#form');
+  $('#dlgTitle').textContent=t?'编辑任务':'新建任务';
+  f.title.value=t?t.title:'';f.priority.value=t?t.priority:'中';f.due.value=t?t.due:'';f.col.value=t?t.col:'todo';
+  $('#dlg').showModal();
+}
+$('#dlg').addEventListener('close',()=>{
+  if($('#dlg').returnValue!=='ok')return;const f=$('#form');
+  const data={title:f.title.value.trim(),priority:f.priority.value,due:f.due.value,col:f.col.value};
+  if(!data.title)return;
+  if(editing)Object.assign(editing,data);else tasks.push({id:Date.now(),...data});
+  save();render();
+});
+$('#addBtn').onclick=()=>openDlg();$('#q').oninput=render;$('#fp').onchange=render;
+render();
+</script>
+</body>
+</html>

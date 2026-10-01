@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{TITLE}}</title>
+<style>
+:root{--primary:#ef4444;--bg:#fff7f5;--card:#ffffff;--text:#1f2937;--muted:#6b7280;--border:#f3e1dc}
+*{box-sizing:border-box}body{margin:0;font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text)}
+.wrap{max-width:880px;margin:0 auto;padding:24px;display:grid;grid-template-columns:1fr 1fr;gap:16px}
+h1{grid-column:1/-1;margin:0;font-size:24px}h1 small{display:block;font-size:13px;color:var(--muted);font-weight:400}
+.card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:20px}
+.timer{text-align:center}.time{font-size:64px;font-weight:700;font-variant-numeric:tabular-nums;margin:10px 0;color:var(--primary)}
+.modes{display:flex;gap:6px;justify-content:center}
+button{font:inherit;padding:8px 14px;border-radius:999px;border:1px solid var(--border);background:var(--card);color:var(--text);cursor:pointer}
+button.on,button.primary{background:var(--primary);border-color:var(--primary);color:#fff}
+.ring{height:8px;background:var(--border);border-radius:9px;overflow:hidden;margin:14px 0}.ring div{height:100%;background:var(--primary);width:0;transition:width .5s}
+ul{list-style:none;padding:0;margin:10px 0 0}li{display:flex;gap:8px;align-items:center;padding:8px 0;border-bottom:1px dashed var(--border)}
+li.done span{text-decoration:line-through;color:var(--muted)}li .cur{margin-left:auto;font-size:12px;color:var(--primary)}
+input{font:inherit;padding:8px 10px;border:1px solid var(--border);border-radius:8px;flex:1;background:var(--card);color:var(--text)}
+.add{display:flex;gap:8px}.stats{grid-column:1/-1}.bars{display:flex;gap:8px;align-items:flex-end;height:120px}
+.bar{flex:1;background:color-mix(in srgb,var(--primary) 70%,transparent);border-radius:6px 6px 0 0;position:relative;min-height:2px}.bar b{position:absolute;top:-18px;width:100%;text-align:center;font-size:12px}
+.lbl{display:flex;gap:8px;font-size:12px;color:var(--muted)}.lbl span{flex:1;text-align:center}
+@media(max-width:720px){.wrap{grid-template-columns:1fr}}
+</style>
+</head>
+<body><div class="wrap">
+<h1 data-title>{{TITLE}}<small>{{SUBTITLE}}</small></h1>
+<div class="card timer">
+  <div class="modes"><button data-min="25" class="on">专注 25</button><button data-min="5">短休 5</button><button data-min="15">长休 15</button></div>
+  <div class="time" id="time">25:00</div><div class="ring"><div id="bar"></div></div>
+  <button class="primary" id="start">开始</button> <button id="reset">重置</button>
+  <p style="color:var(--muted);font-size:13px">当前任务：<b id="curTask">未选择</b></p>
+</div>
+<div class="card"><b>今日任务</b>
+  <div class="add" style="margin-top:10px"><input id="taskIn" placeholder="添加任务，回车确认"><button id="addTask">添加</button></div>
+  <ul id="tasks"></ul></div>
+<div class="card stats"><b>近 7 天专注番茄数</b><div class="bars" id="bars" style="margin-top:24px"></div><div class="lbl" id="lbl"></div></div>
+</div>
+<script>
+const KEY='pomodoro-{{SLUG}}';const $=s=>document.querySelector(s);
+const st=JSON.parse(localStorage.getItem(KEY)||'null')||{tasks:[{id:1,text:'阅读 30 页',done:false,poms:0}],log:{},cur:null};
+const save=()=>localStorage.setItem(KEY,JSON.stringify(st));
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+let total=25*60,left=total,timer=null,mode=25;
+const fmt=s=>String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0');
+function tick(){left--;if(left<=0){clearInterval(timer);timer=null;finish()}paint()}
+function paint(){$('#time').textContent=fmt(Math.max(left,0));$('#bar').style.width=((total-left)/total*100)+'%';$('#start').textContent=timer?'暂停':'开始';document.title=fmt(left)+' · {{TITLE}}'}
+function finish(){if(mode===25){const d=new Date().toISOString().slice(0,10);st.log[d]=(st.log[d]||0)+1;const t=st.tasks.find(x=>x.id===st.cur);if(t)t.poms++;save();renderTasks();renderStats()}
+  try{new AudioContext().resume()}catch(e){}alert(mode===25?'专注完成！休息一下吧 🍅':'休息结束，继续加油！');setMode(mode===25?5:25)}
+function setMode(m){mode=m;clearInterval(timer);timer=null;total=left=m*60;document.querySelectorAll('[data-min]').forEach(b=>b.classList.toggle('on',+b.dataset.min===m));paint()}
+document.querySelectorAll('[data-min]').forEach(b=>b.onclick=()=>setMode(+b.dataset.min));
+$('#start').onclick=()=>{if(timer){clearInterval(timer);timer=null}else timer=setInterval(tick,1000);paint()};
+$('#reset').onclick=()=>setMode(mode);
+function renderTasks(){$('#tasks').innerHTML=st.tasks.map(t=>`<li class="${t.done?'done':''}" data-id="${t.id}"><input type="checkbox" ${t.done?'checked':''} style="flex:none"><span>${esc(t.text)} ${'🍅'.repeat(Math.min(t.poms,8))}</span><span class="cur">${st.cur===t.id?'● 进行中':'<a href="#" data-pick>设为当前</a>'}</span><a href="#" data-del style="color:#999">×</a></li>`).join('');
+  $('#tasks').querySelectorAll('li').forEach(li=>{const t=st.tasks.find(x=>x.id==li.dataset.id);
+    li.querySelector('input').onchange=e=>{t.done=e.target.checked;save();renderTasks()};
+    const p=li.querySelector('[data-pick]');if(p)p.onclick=e=>{e.preventDefault();st.cur=t.id;save();renderTasks()};
+    li.querySelector('[data-del]').onclick=e=>{e.preventDefault();st.tasks=st.tasks.filter(x=>x!==t);save();renderTasks()}});
+  const c=st.tasks.find(x=>x.id===st.cur);$('#curTask').textContent=c?c.text:'未选择'}
+function addTask(){const v=$('#taskIn').value.trim();if(!v)return;st.tasks.push({id:Date.now(),text:v,done:false,poms:0});$('#taskIn').value='';save();renderTasks()}
+$('#addTask').onclick=addTask;$('#taskIn').addEventListener('keydown',e=>{if(e.key==='Enter')addTask()});
+function renderStats(){const days=[...Array(7)].map((_,i)=>{const d=new Date(Date.now()-(6-i)*864e5).toISOString().slice(0,10);return [d,st.log[d]||0]});
+  const max=Math.max(1,...days.map(d=>d[1]));$('#bars').innerHTML=days.map(([d,n])=>`<div class="bar" style="height:${n/max*100}%"><b>${n}</b></div>`).join('');
+  $('#lbl').innerHTML=days.map(([d])=>`<span>${d.slice(5)}</span>`).join('')}
+renderTasks();renderStats();paint();
+</script>
+</body>
+</html>

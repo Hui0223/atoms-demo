@@ -1,0 +1,12 @@
+node_modules/
+.wrangler/
+.dev.vars
+.env
+*.db
+*.sqlite
+.DS_Store
+screenshots/*.tmp
+
+# 笔试题目原文（请勿公开传播）
+题目说明.docx
+*.docx

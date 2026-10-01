@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{TITLE}}</title>
+<style>
+:root{--primary:#10b981;--bg:#f6faf8;--card:#ffffff;--text:#111827;--muted:#6b7280;--border:#e3ece8}
+*{box-sizing:border-box}body{margin:0;font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text)}
+.wrap{max-width:920px;margin:0 auto;padding:24px}
+h1{margin:0;font-size:24px}.sub{color:var(--muted);margin:4px 0 18px;font-size:14px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px;margin-bottom:14px}
+form{display:grid;grid-template-columns:2fr 1fr 1fr auto;gap:8px}
+input,select,textarea,button{font:inherit;padding:9px 10px;border:1px solid var(--border);border-radius:8px;background:var(--card);color:var(--text)}
+button{cursor:pointer}button.primary{background:var(--primary);border-color:var(--primary);color:#fff}
+.bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}.bar input{flex:1;min-width:160px}
+.chips{display:flex;gap:6px;flex-wrap:wrap}.chip{padding:4px 10px;border-radius:999px;border:1px solid var(--border);cursor:pointer;font-size:13px;background:var(--card)}.chip.on{background:var(--primary);color:#fff;border-color:var(--primary)}
+.items{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:10px}
+.item{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:12px;display:flex;flex-direction:column;gap:6px}
+.item.done{opacity:.6}.item.done .t{text-decoration:line-through}.t{font-weight:600;word-break:break-all}
+.item small{color:var(--muted)}.ops{display:flex;gap:6px;margin-top:auto}.ops button{padding:4px 8px;font-size:12px}
+.kpis{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.kpi{background:color-mix(in srgb,var(--primary) 10%,var(--card));border-radius:10px;padding:10px}.kpi b{display:block;font-size:22px}
+.empty{color:var(--muted);text-align:center;padding:30px}
+@media(max-width:640px){form{grid-template-columns:1fr}.kpis{grid-template-columns:1fr}}
+</style>
+</head>
+<body><div class="wrap">
+<h1 data-title>{{TITLE}}</h1><p class="sub">{{SUBTITLE}}</p>
+<div class="card kpis"><div class="kpi">记录总数<b id="kTotal">0</b></div><div class="kpi">已完成<b id="kDone">0</b></div><div class="kpi">本周新增<b id="kWeek">0</b></div></div>
+<div class="card"><form id="form"><input name="title" placeholder="新增一条记录…" required maxlength="100"><input name="tag" placeholder="分类（可选）" maxlength="12"><input name="note" placeholder="备注（可选）" maxlength="100"><button class="primary">添加</button></form></div>
+<div class="card"><div class="bar"><input id="q" placeholder="搜索标题 / 备注"><div class="chips" id="chips"></div><button id="exportBtn">导出 JSON</button></div>
+<div class="items" id="items"></div></div>
+</div>
+<script>
+const KEY='generic-{{SLUG}}';const $=s=>document.querySelector(s);let tag='';
+let items=JSON.parse(localStorage.getItem(KEY)||'null')||{{SEED_JSON}};
+const save=()=>localStorage.setItem(KEY,JSON.stringify(items));
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+function render(){
+  const q=$('#q').value.trim();const tags=[...new Set(items.map(i=>i.tag).filter(Boolean))];
+  $('#chips').innerHTML=['',...tags].map(t=>`<span class="chip ${t===tag?'on':''}" data-t="${esc(t)}">${t?esc(t):'全部'}</span>`).join('');
+  $('#chips').querySelectorAll('.chip').forEach(c=>c.onclick=()=>{tag=c.dataset.t;render()});
+  const list=items.filter(i=>(!tag||i.tag===tag)&&(!q||(i.title+i.note).includes(q)));
+  $('#items').innerHTML=list.length?list.map(i=>`<div class="item ${i.done?'done':''}" data-id="${i.id}"><div class="t">${esc(i.title)}</div>${i.note?`<div>${esc(i.note)}</div>`:''}<small>${i.tag?'#'+esc(i.tag)+' · ':''}${new Date(i.at).toLocaleDateString('zh-CN')}</small><div class="ops"><button data-a="done">${i.done?'撤销':'完成'}</button><button data-a="edit">编辑</button><button data-a="del">删除</button></div></div>`).join(''):'<div class="empty">暂无记录，在上方添加第一条吧</div>';
+  $('#items').querySelectorAll('.item').forEach(el=>{const it=items.find(x=>x.id==el.dataset.id);
+    el.querySelector('[data-a=done]').onclick=()=>{it.done=!it.done;save();render()};
+    el.querySelector('[data-a=edit]').onclick=()=>{const v=prompt('修改标题',it.title);if(v&&v.trim()){it.title=v.trim();save();render()}};
+    el.querySelector('[data-a=del]').onclick=()=>{items=items.filter(x=>x!==it);save();render()}});
+  const week=Date.now()-7*864e5;$('#kTotal').textContent=items.length;$('#kDone').textContent=items.filter(i=>i.done).length;$('#kWeek').textContent=items.filter(i=>i.at>week).length;
+}
+$('#form').addEventListener('submit',e=>{e.preventDefault();const f=e.target;items.unshift({id:Date.now(),title:f.title.value.trim(),tag:f.tag.value.trim(),note:f.note.value.trim(),done:false,at:Date.now()});save();f.reset();render()});
+$('#q').oninput=render;
+$('#exportBtn').onclick=()=>{const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(items,null,2)],{type:'application/json'}));a.download='data.json';a.click()};
+render();
+</script>
+</body>
+</html>

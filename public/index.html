@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Atoms Demo · 一句话生成可运行的应用</title>
+<meta name="description" content="多智能体协作 + 赛马模式 + 增量迭代：输入一句话，生成一个能打开、能点、能存数据的网页应用。">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="logo" href="#/"><span class="logo-mark">⚛</span> Atoms <b>Demo</b></a>
+  <nav>
+    <a href="#/" data-nav="home">创作</a>
+    <a href="#/plaza" data-nav="plaza">广场</a>
+    <a href="#/projects" data-nav="projects">我的项目</a>
+  </nav>
+  <div class="userbox" id="userbox"></div>
+</header>
+<main id="app"></main>
+<div id="toast" class="toast" hidden></div>
+
+<dialog id="authDlg" class="dlg">
+  <form id="authForm" method="dialog">
+    <div class="tabs"><button type="button" data-tab="login" class="on">登录</button><button type="button" data-tab="register">注册</button></div>
+    <p class="muted small" id="authTip">登录后即可保存你的项目与版本历史。</p>
+    <label>用户名<input name="username" autocomplete="username" required minlength="3" maxlength="20" placeholder="3-20 位字母 / 数字 / 中文"></label>
+    <label>密码<input name="password" type="password" autocomplete="current-password" required minlength="6" maxlength="64" placeholder="至少 6 位"></label>
+    <p class="err" id="authErr"></p>
+    <button class="btn primary block" id="authSubmit" value="submit">登录</button>
+    <button type="button" class="btn ghost block" id="guestBtn">👀 先以游客身份体验（之后可升级为正式账号）</button>
+    <button type="button" class="btn link" id="authClose">关闭</button>
+  </form>
+</dialog>
+
+<script type="module" src="/app.js"></script>
+</body>
+</html>
