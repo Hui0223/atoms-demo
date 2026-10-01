@@ -21,6 +21,16 @@
 <main id="app"></main>
 <div id="toast" class="toast" hidden></div>
 
+<dialog id="intentDlg" class="dlg">
+  <form method="dialog">
+    <h3>这是新应用还是修改？</h3>
+    <p class="muted small" id="intentTip">这条需求看起来既可能是修改当前应用，也可能是要做一个新应用。</p>
+    <button type="button" class="btn primary block" id="intentEdit">修改当前应用</button>
+    <button type="button" class="btn block" id="intentNew">新建项目</button>
+    <button type="button" class="btn link" id="intentClose">取消</button>
+  </form>
+</dialog>
+
 <dialog id="authDlg" class="dlg">
   <form id="authForm" method="dialog">
     <div class="tabs"><button type="button" data-tab="login" class="on">登录</button><button type="button" data-tab="register">注册</button></div>

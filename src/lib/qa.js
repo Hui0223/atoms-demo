@@ -1,5 +1,5 @@
-// 静态 QA + 评分（赛马择优用）。Workers 运行时禁止 eval，因此不做 JS 语法执行检查，
-// 运行时错误由前端预览 iframe 捕获后回传（见 public/app.js）。
+// 静态 QA + 评分（赛马择优用）。Workers 运行时禁止 eval，因此 JS 运行时检查在浏览器隐藏沙箱里做，
+// 结果回传后由 applyRuntime 并入分数（见 public/app.js 的探针与 POST /runtime-check）。
 
 function scriptBlocks(html) {
   const out = [];
@@ -89,4 +89,54 @@ export function scoreHtml(html, features = []) {
   add('实现完整度', Math.min(5, Math.floor((html || '').length / 1600)), 5);
   const total = items.reduce((s, i) => s + i.got, 0);
   return { total, items, qa };
+}
+
+function clamp(n, lo, hi) { return Math.max(lo, Math.min(hi, n)); }
+
+// 按 message 去重，保留首次出现的行号
+function distinctErrors(errors) {
+  const out = [];
+  const seen = new Set();
+  if (!Array.isArray(errors)) return out;
+  for (const e of errors) {
+    const message = String(e && typeof e === 'object' ? (e.message || '') : (e || '')).trim().slice(0, 300);
+    if (!message || seen.has(message)) continue;
+    seen.add(message);
+    out.push({ message, line: e && typeof e === 'object' && e.line ? (e.line | 0) : 0 });
+  }
+  return out;
+}
+
+/**
+ * 把客户端运行时报告并入评分。输入 score.total 视为静态总分（0–100）；
+ * 若已套用过，则用 staticTotal，重复调用不会叠扣。
+ * - 新分项「运行时检查」满分 15：无错误且非白屏 15；白屏 0；否则每个不同错误扣 8，最低 0。
+ * - 对外总分仍归一化到 0–100：在静态总分上，有错误扣 30（封顶 30），白屏扣 40。不把 15 分再加进总分。
+ */
+export function applyRuntime(score, report) {
+  const base = score && typeof score === 'object' ? score : { total: 0, items: [] };
+  const already = base.runtime && base.staticTotal != null;
+  const staticTotal = clamp(Math.round(Number(already ? base.staticTotal : base.total) || 0), 0, 100);
+  const errors = distinctErrors(report && report.errors);
+  const blank = !!(report && report.blank);
+  const got = blank ? 0 : Math.max(0, 15 - errors.length * 8);
+  const items = (Array.isArray(base.items) ? base.items : []).filter((i) => i && i.name !== '运行时检查');
+  items.push({ name: '运行时检查', got, max: 15 });
+  const penalty = blank ? 40 : Math.min(30, errors.length > 0 ? 30 : 0);
+  const total = clamp(staticTotal - penalty, 0, 100);
+  return {
+    total,
+    staticTotal,
+    items,
+    qa: base.qa || { ok: true, issues: [] },
+    runtime: {
+      blank,
+      errors,
+      errorCount: errors.length,
+      penalty,
+      clean: !blank && errors.length === 0,
+      textLen: report && report.textLen ? (report.textLen | 0) : 0,
+      nodes: report && report.nodes ? (report.nodes | 0) : 0,
+    },
+  };
 }

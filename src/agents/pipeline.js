@@ -2,7 +2,7 @@
 import { resilientChat, CanceledError, StoppedError } from './llm.js';
 import { channelsFor, laneModelId } from './models.js';
 import { PLANNER_SYSTEM, LANE_VARIANTS, engineerSystem, engineerUser, EDITOR_SYSTEM, editorUser, editorRepair } from './prompts.js';
-import { extractHtml, parseLooseJson } from '../lib/html.js';
+import { extractHtml, parseLooseJson, injectRuntimeFault } from '../lib/html.js';
 import { injectDesignSystem, stripDesignSystem } from '../lib/designSystem.js';
 import { qaCheck, scoreHtml } from '../lib/qa.js';
 import { parsePatches, applyPatches } from '../lib/patch.js';
@@ -56,15 +56,30 @@ export async function runGenerate(ctx, { prompt, lanes = 2 }) {
   let plan = heuristicPlan(prompt);
   let planMode = 'heuristic';
   if (!demo) {
+    const planChannels = channelsFor(env, mainId(ctx), { attempts: 2, backupAttempts: 1 });
+    let planChars = 0, planLast = 0;
+    emit('lane', { lane: 'P', name: '需求拆解', status: 'thinking', chars: 0, model: short(planChannels[0].model) });
     try {
-      const r = await resilientChat(env, { messages: [{ role: 'system', content: PLANNER_SYSTEM }, { role: 'user', content: prompt }], maxTokens: 2500, temperature: 0.2, deadline: Math.min(deadline, Date.now() + 25_000), checkCancel },
-        { channels: channelsFor(env, mainId(ctx), { attempts: 2, backupAttempts: 1 }), simulate: ctx.simulate, log: log('planner') });
+      const r = await resilientChat(env, {
+        messages: [{ role: 'system', content: PLANNER_SYSTEM }, { role: 'user', content: prompt }],
+        maxTokens: 2500, temperature: 0.2, deadline: Math.min(deadline, Date.now() + 25_000), checkCancel,
+        onDelta: ({ text, reasoning }) => {
+          planChars = (text || '').length + (reasoning || 0);
+          if (Date.now() - planLast < 350) return;
+          planLast = Date.now();
+          emit('lane', { lane: 'P', name: '需求拆解', status: text ? 'coding' : 'thinking', chars: planChars, tail: (text || '').slice(-400) });
+        },
+      }, { channels: planChannels, simulate: ctx.simulate, log: log('planner') });
       const j = parseLooseJson(r.text);
       if (j && Array.isArray(j.features) && j.features.length) { plan = { ...plan, ...j, features: j.features.slice(0, 6).map(String) }; planMode = 'ai'; }
+      emit('lane', { lane: 'P', status: 'done', chars: (r.text || '').length || planChars, tail: (r.text || '').slice(-400) });
     } catch (e) {
       if (e instanceof CanceledError) throw e;
+      emit('lane', { lane: 'P', status: 'failed', error: e.message, chars: planChars });
       emit('log', { agent: 'planner', level: 'warn', text: '规划模型不可用，改用规则拆解：' + e.message });
     }
+  } else {
+    emit('lane', { lane: 'P', name: '需求拆解', status: 'done', chars: 0, model: 'rules' });
   }
   await say('planner', `需求拆解完成：**${plan.title}**\n${plan.summary || ''}`, { plan, mode: planMode });
   await store.updateJob(jobId, 'running', { stage: 'build', plan });
@@ -85,11 +100,12 @@ export async function runGenerate(ctx, { prompt, lanes = 2 }) {
   };
 
   const results = await Promise.all(variants.map(async (v, i) => {
+    const laneChannels = channelsFor(env, laneModelId(ctx.modelChoice || 'deepseek', i));
+    emit('lane', { lane: v.id, name: v.name, status: 'queued', chars: 0, model: short(laneChannels[0].model) });
     await sleep(i * 1500); // 节流：错峰启动，降低撞 429 概率
     const t0 = Date.now();
     let lastEmit = 0;
-    const laneChannels = channelsFor(env, laneModelId(ctx.modelChoice || 'deepseek', i));
-    emit('lane', { lane: v.id, name: v.name, status: 'running', chars: 0, model: short(laneChannels[0].model) });
+    emit('lane', { lane: v.id, status: 'thinking', chars: 0 });
     try {
       const r = await resilientChat(env, {
         messages: [{ role: 'system', content: engineerSystem(v.desc) }, { role: 'user', content: engineerUser(prompt, plan) }],
@@ -97,12 +113,14 @@ export async function runGenerate(ctx, { prompt, lanes = 2 }) {
         onDelta: ({ text, reasoning }) => {
           if (Date.now() - lastEmit < 350) return;
           lastEmit = Date.now();
-          emit('lane', { lane: v.id, status: text ? 'coding' : 'thinking', chars: text.length, reasoning, tail: text.slice(-240) });
+          emit('lane', { lane: v.id, status: text ? 'coding' : 'thinking', chars: (text || '').length + (reasoning || 0), tail: (text || '').slice(-400) });
         },
       }, { channels: laneChannels, simulate: ctx.simulate, log: (l) => emit('log', { agent: 'engineer', lane: v.id, ...l }) });
       const raw = extractHtml(r.text);
       const score = scoreHtml(raw, plan.features); // 在注入设计系统前打分，避免基础样式“刷分”
-      const html = injectDesignSystem(raw);
+      let html = injectDesignSystem(raw);
+      // 故障演练 runtimeError：静态分已算完，再往方案 A 注入必抛错脚本（不影响模型调用）
+      if (ctx.simulate === 'runtimeError' && v.id === 'A') html = injectRuntimeFault(html);
       const ms = Date.now() - t0;
       const status = score.qa.ok ? 'done' : 'failed';
       emit('lane', { lane: v.id, status, chars: html.length, score: score.total, model: short(r.model), channel: r.channel, ms, issues: score.qa.issues });
@@ -110,8 +128,9 @@ export async function runGenerate(ctx, { prompt, lanes = 2 }) {
       return { v, html, score, model: r.model, channel: r.channel, ms, ok: score.qa.ok, error: score.qa.ok ? null : score.qa.issues.join('；') };
     } catch (e) {
       if (e instanceof CanceledError) throw e;
-      emit('lane', { lane: v.id, status: 'failed', error: e.message, ms: Date.now() - t0 });
-      return { v, ok: false, error: e.message };
+      const stopped = e instanceof StoppedError || e?.kind === 'stopped';
+      emit('lane', { lane: v.id, status: stopped ? 'stopped' : 'failed', error: e.message, ms: Date.now() - t0 });
+      return { v, ok: false, error: e.message, stopped };
     }
   }).map((p, i) => p.finally(() => stoppers[i].dispose())));
   clearTimeout(graceTimer);
@@ -128,7 +147,7 @@ export async function runGenerate(ctx, { prompt, lanes = 2 }) {
       const cid = await store.addVersion(projectId, { html: r.html, note: `候选方案 ${r.v.id}（${r.v.name}）`, kind: 'race', mode: r.channel === 'primary' ? 'ai' : 'backup', model: short(r.model), score: r.score, lane: r.v.id, candidate: true, jobId });
       candidates.push({ id: cid, lane: r.v.id, name: r.v.name, score: r.score.total });
     }
-    const board = results.map((r) => ({ lane: r.v.id, name: r.v.name, ok: r.ok, score: r.score?.total ?? 0, items: r.score?.items || [], model: r.model ? short(r.model) : '-', channel: r.channel || '-', ms: r.ms || 0, error: r.error }));
+    const board = results.map((r) => ({ lane: r.v.id, name: r.v.name, ok: r.ok, score: r.score?.total ?? 0, staticScore: r.score?.total ?? 0, finalScore: r.score?.total ?? 0, runtimeLabel: r.ok ? '待检查' : '—', items: r.score?.items || [], model: r.model ? short(r.model) : '-', channel: r.channel || '-', ms: r.ms || 0, error: r.error }));
     await say('qa', n > 1 ? `赛马结果：方案 ${win.v.id}（${win.v.name}）以 ${win.score.total} 分胜出${candidates.length ? '，其余方案已保留为候选，可一键切换' : ''}。` : `QA 通过，综合评分 ${win.score.total} 分。`,
       { versionId: vid, board, winner: win.v.id, candidates, mode });
     return { status: 'done', versionId: vid, mode };
@@ -165,6 +184,7 @@ export async function runEdit(ctx, { request, baseVersionId }) {
   };
 
   const tryDemo = async (why) => {
+    emit('stage', { stage: 'qa', text: '正在用规则引擎应用修改…' });
     const r = demoEdit(original, request);
     if (r.changes.length && qaCheck(r.html).ok) {
       const { vid } = await commit(r.html, `规则修改：${r.changes.join('、')}`, 'demo', 'rules');
@@ -175,15 +195,22 @@ export async function runEdit(ctx, { request, baseVersionId }) {
     return { status: 'noop' };
   };
 
-  if (demo) return tryDemo('');
+  if (demo) {
+    emit('stage', { stage: 'edit', text: '演示模式：按规则修改…' });
+    return tryDemo('');
+  }
 
   emit('stage', { stage: 'edit', text: '编辑智能体正在生成增量补丁…' });
-  let lastEmit = 0;
+  let lastEmit = 0, editChars = 0;
   const stopper = makeStopper(store, jobId);
   const chs = channelsFor(env, mainId(ctx), { attempts: 2, backupAttempts: 2 });
+  emit('lane', { lane: 'E', name: '增量补丁', status: 'thinking', chars: 0, model: short(chs[0].model) });
   const call = (messages, list) => resilientChat(env, {
     messages, maxTokens: 6000, temperature: 0.2, deadline, stopSignal: stopper.signal, isStopped: stopper.isStopped,
-    onDelta: ({ text, reasoning }) => { if (Date.now() - lastEmit > 350) { lastEmit = Date.now(); emit('lane', { lane: 'E', status: text ? 'coding' : 'thinking', chars: text.length, reasoning, tail: text.slice(-240) }); } },
+    onDelta: ({ text, reasoning }) => {
+      editChars = (text || '').length + (reasoning || 0);
+      if (Date.now() - lastEmit > 350) { lastEmit = Date.now(); emit('lane', { lane: 'E', status: text ? 'coding' : 'thinking', chars: editChars, tail: (text || '').slice(-400) }); }
+    },
   }, { channels: list, simulate: ctx.simulate, log: (l) => emit('log', { agent: 'editor', ...l }) });
 
   // 一轮尝试：生成补丁 → 应用 → 若有未匹配块则让同一模型修正一次
@@ -228,16 +255,19 @@ export async function runEdit(ctx, { request, baseVersionId }) {
       let out;
       try { out = await attempt(i === 0 ? chs : [chs[i]]); }
       catch (e) { if (e instanceof CanceledError) throw e; if (i === 0) throw e; why = e.message; break; }
+      emit('stage', { stage: 'qa', text: '正在应用补丁并做静态检查…' });
       why = verdict(out);
       if (!why) ok = out;
       else emit('log', { agent: 'qa', level: 'warn', text: why });
     }
     if (!ok) {
+      emit('lane', { lane: 'E', status: 'failed', chars: editChars, error: why });
       await say('qa', `❌ ${why}。为保护已有成果，本次修改未落库，当前版本（v${base.n}）保持不变，可换个更具体的说法重试。`, { kept: base.id });
       return { status: 'rejected' };
     }
     const { r, html, applied } = ok;
     const mode = r.channel === 'primary' ? 'ai' : 'backup';
+    emit('lane', { lane: 'E', status: 'done', chars: editChars, model: short(r.model) });
     const { vid, score } = await commit(html, `修改：${request.slice(0, 40)}`, mode, short(r.model));
     const delta = html.length - original.length;
     await say('editor', `已应用 ${applied} 处增量修改（${delta >= 0 ? '+' : ''}${delta} 字符，模型 ${short(r.model)}），QA 通过，评分 ${score.total}。`, { versionId: vid, mode, applied });

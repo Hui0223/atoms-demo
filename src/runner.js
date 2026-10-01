@@ -19,11 +19,57 @@ export function startRun(env, store, { projectId, userId, body }) {
   const writer = writable.getWriter();
   const enc = new TextEncoder();
   let open = true;
+  // runtimeError 只影响生成产物（pipeline 注入），不进入模型调用的 simulate 分支
+  const simulate = ['primary429', 'alldown', 'runtimeError'].includes(body.simulate) ? body.simulate : 'none';
+  // 意图在 /intent 判定；type==='edit' 一律走增量补丁，不因文案像新需求而整页重生成
+  const progress = { stage: type === 'edit' ? 'edit' : 'plan', stageText: '', stageStartedAt: Date.now(), laneCount: type === 'edit' ? 1 : (body.lanes ?? 2), type, lanes: {} };
+  let lastSnap = 0;
+  const snapshot = (force) => {
+    const n = Date.now();
+    if (!force && n - lastSnap < 2000) return;
+    lastSnap = n;
+    const lanes = {};
+    for (const [k, v] of Object.entries(progress.lanes)) {
+      lanes[k] = { lane: v.lane, name: v.name || '', status: v.status || 'queued', chars: v.chars || 0, model: v.model || '', elapsed: v.elapsed || 0, cps: v.cps || 0, score: v.score, error: v.error ? String(v.error).slice(0, 140) : undefined };
+    }
+    try {
+      store.updateJob(jobId, null, { progress: { stage: progress.stage, stageText: progress.stageText, stageStartedAt: progress.stageStartedAt, laneCount: progress.laneCount, type, lanes } });
+    } catch {}
+  };
   const emit = (event, data) => {
     if (!open) return;
-    writer.write(enc.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)).catch(() => { open = false; });
+    let payload = data;
+    if (event === 'stage' && data) {
+      progress.stage = data.stage || progress.stage;
+      progress.stageText = data.text || '';
+      progress.stageStartedAt = Date.now();
+      if (data.lanes && data.lanes.length) progress.laneCount = data.lanes.length;
+      payload = { ...data, at: progress.stageStartedAt };
+      snapshot(true);
+    } else if (event === 'lane' && data && data.lane) {
+      const prev = progress.lanes[data.lane] || {};
+      const startedAt = prev.startedAt || Date.now();
+      const chars = data.chars != null ? data.chars : (prev.chars || 0);
+      const elapsed = Date.now() - startedAt;
+      const cps = elapsed > 500 ? Math.round((chars * 1000) / elapsed) : (prev.cps || 0);
+      const merged = {
+        ...prev, ...data, startedAt, chars, elapsed, cps,
+        name: data.name || prev.name || '',
+        model: data.model || prev.model || '',
+        status: data.status || prev.status || 'queued',
+      };
+      progress.lanes[data.lane] = merged;
+      payload = { lane: merged.lane, name: merged.name, status: merged.status, chars, model: merged.model, elapsed, cps };
+      if (merged.score != null) payload.score = merged.score;
+      if (merged.error) payload.error = merged.error;
+      if (data.tail != null) payload.tail = String(data.tail).slice(-400);
+      if (data.channel) payload.channel = data.channel;
+      if (data.issues) payload.issues = data.issues;
+      if (data.ms != null) payload.ms = data.ms;
+      snapshot(lastSnap === 0);
+    }
+    writer.write(enc.encode(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`)).catch(() => { open = false; });
   };
-  const simulate = ['primary429', 'alldown'].includes(body.simulate) ? body.simulate : 'none';
   const jctx = { env, store, jobId, projectId, emit, simulate, demo: !!body.demo, modelChoice };
   const startedAt = Date.now();
   const heartbeat = setInterval(() => emit('ping', { elapsed: Date.now() - startedAt }), 5000);
@@ -33,7 +79,8 @@ export function startRun(env, store, { projectId, userId, body }) {
     let result;
     try {
       result = type === 'edit' ? await runEdit(jctx, { request: text, baseVersionId: body.baseVersionId || row.current_version_id }) : await runGenerate(jctx, { prompt: text, lanes: body.lanes ?? 2 });
-      store.updateJob(jobId, result.status === 'done' ? 'done' : result.status, { result });
+      const status = result.status === 'done' ? 'done' : result.status;
+      store.updateJob(jobId, status, { result, needsRuntime: status === 'done' });
     } catch (e) {
       // 异常绝不穿透：取消 / 未知错误都转成可展示的状态
       if (e instanceof CanceledError) {

@@ -9,6 +9,19 @@ const md = (s) => esc(s).replace(/\*\*(.+?)\*\*/g, '<b>$1</b>').replace(/`([^`]+
 const fmtTime = (t) => { const d = new Date(t); return `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`; };
 const MODE_TAG = { ai: ['ai', 'AI 生成'], backup: ['backup', '备用模型'], demo: ['demo', '演示模式'], preset: ['preset', '官方示例'] };
 const modeTag = (m) => { const t = MODE_TAG[m]; return t ? `<span class="tag ${t[0]}">${t[1]}</span>` : ''; };
+function runtimeTag(v) {
+  const rt = v && v.score_json && v.score_json.runtime;
+  if (!rt) return '';
+  if (rt.blank) return '<span class="tag demo">白屏</span>';
+  if (rt.errorCount) return `<span class="tag demo">运行时 ${rt.errorCount} 错</span>`;
+  return '<span class="tag ai">运行时通过</span>';
+}
+function scoreTags(v) {
+  if (!v || v.score == null) return '';
+  const stc = v.score_json && v.score_json.staticTotal;
+  const diff = stc != null && stc !== v.score ? `<span class="tag">静态 ${stc}</span>` : '';
+  return `<span class="tag">评分 ${v.score}</span>${diff}${runtimeTag(v)}`;
+}
 const AGENTS = {
   planner: ['📋', 'Emma · 产品经理'], engineer: ['💻', 'Alex · 工程师'], editor: ['✏️', 'Alex · 工程师（迭代）'],
   qa: ['🧪', 'Iris · 测试与评审'], system: ['⚙️', '系统'],
@@ -21,6 +34,17 @@ const EXAMPLES = [
   '单词卡片背诵工具，支持翻面、标记熟悉度和复习进度',
 ];
 const EDIT_SUGGESTIONS = ['把主色调换成蓝色', '切换为深色主题', '增加一个“导出数据为 JSON”的按钮', '标题改为「我的效率工具」'];
+
+// 赛马表里缩短模型名（deepseek-v4-flash → DS-v4，glm-5.3-flash → GLM-5.3）；完整名字放 title。
+function shortModel(name) {
+  const full = String(name || '').trim();
+  if (!full || full === '-') return full;
+  let s = full.split('/').pop().trim();
+  s = s.replace(/[\s_-]*flash\b/ig, '');
+  s = s.replace(/^deepseek[\s._-]*/i, 'DS-').replace(/^glm[\s._-]*/i, 'GLM-');
+  s = s.replace(/^[-_.\s]+|[-_.\s]+$/g, '');
+  return s || full;
+}
 
 function toast(msg, ms = 2600) {
   const t = $('#toast'); t.textContent = msg; t.hidden = false;
@@ -169,7 +193,95 @@ function composerOptions(prefix = '') {
       <select id="${prefix}lanes"><option value="1">1 路</option><option value="2" selected>2 路</option><option value="3">3 路</option></select></label>
     <label class="opt" title="不调用模型，使用内置模板与规则引擎（额度为零时也能完整演示）"><input type="checkbox" id="${prefix}demo"> 演示模式</label>
     <label class="opt" title="故障演练：验证重试 / 备用模型 / 降级兜底链路">🧯 故障演练
-      <select id="${prefix}simulate"><option value="none">关闭</option><option value="primary429">主模型 429</option><option value="alldown">全部模型不可用</option></select></label>`;
+      <select id="${prefix}simulate"><option value="none">关闭</option><option value="primary429">主模型 429</option><option value="alldown">全部模型不可用</option><option value="runtimeError">运行时报错（方案 A 注入错误）</option></select></label>`;
+}
+
+// recommend: 'new' 时主按钮是「新建项目（推荐）」；否则维持原选择框，不标推荐
+function askIntentChoice(text, opt = {}) {
+  return new Promise((resolve) => {
+    const dlg = $('#intentDlg');
+    if (!dlg) { resolve(null); return; }
+    const tip = $('#intentTip');
+    const editBtn = $('#intentEdit');
+    const newBtn = $('#intentNew');
+    const closeBtn = $('#intentClose');
+    const snippet = `「${String(text).slice(0, 42)}」`;
+    const recommendNew = opt.recommend === 'new';
+    if (tip) {
+      tip.textContent = recommendNew
+        ? `模型判断${snippet}是一个全新的应用。可以新建项目，也可以仍在当前应用上修改。`
+        : `${snippet}不太好判断是在改当前应用，还是要做一个全新的应用。`;
+    }
+    if (editBtn && newBtn) {
+      newBtn.textContent = recommendNew ? '新建项目（推荐）' : '新建项目';
+      editBtn.textContent = '修改当前应用';
+      newBtn.className = recommendNew ? 'btn primary block' : 'btn block';
+      editBtn.className = recommendNew ? 'btn block' : 'btn primary block';
+      const form = dlg.querySelector('form');
+      if (form) {
+        if (recommendNew) form.insertBefore(newBtn, editBtn);
+        else form.insertBefore(editBtn, newBtn);
+        if (closeBtn) form.appendChild(closeBtn);
+      }
+    }
+    let settled = false;
+    const done = (v) => {
+      if (settled) return;
+      settled = true;
+      dlg.removeEventListener('cancel', onCancel);
+      dlg.removeEventListener('close', onClose);
+      if (dlg.open) dlg.close();
+      resolve(v);
+    };
+    const onCancel = (e) => { e.preventDefault(); done(null); };
+    const onClose = () => done(null);
+    if (editBtn) editBtn.onclick = () => done('edit');
+    if (newBtn) newBtn.onclick = () => done('new');
+    if (closeBtn) closeBtn.onclick = () => done(null);
+    dlg.addEventListener('cancel', onCancel);
+    dlg.addEventListener('close', onClose);
+    if (!dlg.open) dlg.showModal();
+  });
+}
+
+// 隐藏沙箱运行时探针：无同源、不桥接存储，约 2.5s 后收报告，单路最多 5s
+function probeHtml(html, versionId) {
+  return new Promise((resolve) => {
+    const f = document.createElement('iframe');
+    f.setAttribute('sandbox', 'allow-scripts');
+    f.setAttribute('referrerpolicy', 'no-referrer');
+    f.dataset.probe = '1';
+    f.dataset.pid = 'probe';
+    f.title = 'runtime-check';
+    f.setAttribute('aria-hidden', 'true');
+    f.style.cssText = 'position:fixed;left:-12000px;top:0;width:800px;height:600px;border:0;visibility:hidden;pointer-events:none';
+    let done = false;
+    const finish = (rep) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      window.removeEventListener('message', onMsg);
+      try { f.remove(); } catch {}
+      resolve({
+        errors: Array.isArray(rep && rep.errors) ? rep.errors : [],
+        blank: !!(rep && rep.blank),
+        textLen: (rep && rep.textLen) | 0,
+        nodes: (rep && rep.nodes) | 0,
+        timeout: !!(rep && rep.timeout),
+      });
+    };
+    const onMsg = (e) => {
+      const d = e.data;
+      if (!d || typeof d !== 'object') return;
+      if (d.type !== 'atoms-runtime-report' && d.__atoms !== 'runtime-report') return;
+      if (String(d.probeId || '') !== String(versionId)) return;
+      finish(d);
+    };
+    const timer = setTimeout(() => finish({ errors: [], blank: false, timeout: true }), 5000);
+    window.addEventListener('message', onMsg);
+    document.body.appendChild(f);
+    f.srcdoc = injectShim(html, { storageKey: 'probe-' + versionId, bridge: false, probe: true, probeId: versionId });
+  });
 }
 
 function viewHome(app) {
@@ -270,7 +382,8 @@ async function viewProject(app, id) {
     if ($('#lg')) $('#lg').onclick = () => openAuth('login');
     return;
   }
-  const st = { data, viewVersionId: data.project.currentVersionId, tab: 'preview', device: 'desktop', running: null, html: data.html, runtimeError: null };
+  const st = { data, viewVersionId: data.project.currentVersionId, tab: 'preview', device: 'desktop', running: null, html: data.html, runtimeError: null, checkingRuntime: false, checkingThis: null, follow: true };
+  let alive = true;
   const owner = data.isOwner;
 
   app.innerHTML = `
@@ -295,13 +408,32 @@ async function viewProject(app, id) {
   </div>`;
 
   const msgsEl = $('#msgs');
+  let scrollLock = 0;
+  // scrollTop 赋值会同步触发 scroll。锁住这一下，避免把程序滚动当成用户往上翻
+  function setScrollTop(y) {
+    scrollLock++;
+    msgsEl.scrollTop = y;
+    scrollLock--;
+  }
+  msgsEl.addEventListener('scroll', () => {
+    if (scrollLock || !st.running) return;
+    const gap = msgsEl.scrollHeight - msgsEl.scrollTop - msgsEl.clientHeight;
+    st.follow = gap < 64;
+  });
+  function pinToProgress() {
+    if (st.follow === false || !st.running) return;
+    setScrollTop(msgsEl.scrollHeight);
+  }
 
   // ----- 消息渲染 -----
   function renderMessages() {
+    const keep = msgsEl.scrollTop;
+    const follow = st.follow !== false;
     msgsEl.innerHTML = '';
     st.data.messages.forEach((m) => msgsEl.appendChild(messageEl(m)));
     if (st.running) msgsEl.appendChild(st.running.el);
-    msgsEl.scrollTop = msgsEl.scrollHeight;
+    if (!st.running || follow) setScrollTop(msgsEl.scrollHeight);
+    else setScrollTop(keep);
   }
   function messageEl(m) {
     const el = document.createElement('div');
@@ -317,13 +449,17 @@ async function viewProject(app, id) {
     let extra = '';
     const meta = m.meta || {};
     if (meta.plan && meta.plan.features) extra += `<ul>${meta.plan.features.map((f) => `<li>${esc(f)}</li>`).join('')}</ul>${meta.mode === 'heuristic' ? '<div class="small muted">（规则拆解）</div>' : ''}`;
-    if (meta.board && meta.board.length > 1) {
-      extra += `<table class="board"><tr><th>方案</th><th>评分</th><th>模型</th><th>耗时</th><th></th></tr>${meta.board.map((b) => {
+    if (meta.board && meta.board.length && (meta.board.length > 1 || meta.runtime)) {
+      extra += `<div class="board-wrap"><table class="board"><tr><th>方案</th><th>静态</th><th>运行时</th><th>最终</th><th>模型</th><th>耗时</th><th></th></tr>${meta.board.map((b) => {
         const cand = (meta.candidates || []).find((c) => c.lane === b.lane);
         const tip = b.items && b.items.length ? b.items.map((i) => `${i.name} ${i.got}/${i.max}`).join('\n') : (b.error || '');
-        return `<tr class="${b.lane === meta.winner ? 'win' : ''}" title="${esc(tip)}"><td>${esc(b.lane)} · ${esc(b.name)}</td><td>${b.ok ? b.score : '失败'}</td><td>${esc(b.model)}</td><td>${b.ms ? (b.ms / 1000).toFixed(0) + 's' : '-'}</td>
+        const stat = b.staticScore != null ? b.staticScore : b.score;
+        const fin = b.finalScore != null ? b.finalScore : b.score;
+        const rt = b.runtimeLabel === '待检查' ? '<span class="muted">…</span>' : esc(b.runtimeLabel || '—');
+        const modelFull = b.model || '';
+        return `<tr class="${b.lane === meta.winner ? 'win' : ''}" title="${esc(tip)}"><td>${esc(b.lane)} · ${esc(b.name || '')}</td><td class="num">${b.ok ? stat : '失败'}</td><td class="num">${rt}</td><td class="num">${b.ok ? fin : '-'}</td><td class="model" title="${esc(modelFull)}">${esc(shortModel(modelFull) || '—')}</td><td class="num">${b.ms ? (b.ms / 1000).toFixed(0) + 's' : '-'}</td>
           <td>${b.lane === meta.winner ? '🏆 已采用' : cand && owner ? `<button class="btn sm" data-adopt="${cand.id}">采用</button>` : cand ? `<button class="btn sm" data-view="${cand.id}">查看</button>` : ''}</td></tr>`;
-      }).join('')}</table><div class="small muted" style="margin-top:4px">鼠标悬停查看评分细项</div>`;
+      }).join('')}</table></div><div class="small muted" style="margin-top:4px">鼠标悬停查看评分细项</div>`;
     }
     if (meta.versionId) {
       const v = st.data.versions.find((x) => x.id === meta.versionId);
@@ -359,57 +495,234 @@ async function viewProject(app, id) {
     $$('.quick .chip', c).forEach((ch) => (ch.onclick = () => { ask.value = ch.textContent; ask.focus(); }));
     ask.addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) $('#send').click(); });
     const opts = () => ({ lanes: +$('#wlanes').value, model: $('#wmodel').value, demo: $('#wdemo').checked, simulate: $('#wsimulate').value });
-    $('#send').onclick = () => {
+    async function spawnNewProject(text, o) {
+      const { id: nid } = await api('/api/projects', { method: 'POST', body: { prompt: text } });
+      sessionStorage.setItem('atoms_autostart', JSON.stringify({ id: nid, prompt: text, lanes: o.lanes, model: o.model, demo: !!o.demo, simulate: o.simulate || 'none' }));
+      const title = text.replace(/\s+/g, ' ').slice(0, 24);
+      toast(`检测到这是一个全新应用需求，已为你新建项目「${title}」`, 4200);
+      location.hash = '#/p/' + nid;
+    }
+    $('#send').onclick = async () => {
       const text = ask.value.trim();
-      if (!text) { if (!hasVersion) startRun({ type: 'generate', prompt: st.data.project.prompt, ...opts() }); else ask.focus(); return; }
-      startRun({ type: hasVersion ? 'edit' : 'generate', prompt: text, ...opts() });
+      const o = opts();
+      if (!text) { if (!hasVersion) startRun({ type: 'generate', prompt: st.data.project.prompt, ...o }); else ask.focus(); return; }
+      if (!hasVersion) { startRun({ type: 'generate', prompt: text, ...o }); return; }
+      const btn = $('#send');
+      btn.disabled = true; const prevLabel = btn.textContent; btn.textContent = '判断中…';
+      let decision;
+      try { decision = await api(`/api/projects/${id}/intent`, { method: 'POST', body: { prompt: text } }); }
+      catch { decision = { intent: 'unsure', confidence: 0 }; }
+      finally { if (btn.isConnected) { btn.disabled = false; btn.textContent = prevLabel; } }
+      if (!ask.isConnected) return;
+      const fromModel = decision.source === 'model';
+      // 规则高置信度的新应用直接开项目；模型判 new 先确认；模型或规则判 edit 直接打补丁
+      const rulesNew = !fromModel && decision.intent === 'new' && decision.confidence >= 0.75;
+      try {
+        if (rulesNew) { await spawnNewProject(text, o); return; }
+        if (decision.intent === 'edit') {
+          toast('将修改当前应用');
+          startRun({ type: 'edit', prompt: text, ...o });
+          return;
+        }
+        const choice = await askIntentChoice(text, fromModel && decision.intent === 'new' ? { recommend: 'new' } : {});
+        if (!ask.isConnected) return;
+        if (choice === 'new') await spawnNewProject(text, o);
+        else if (choice === 'edit') { toast('将修改当前应用'); startRun({ type: 'edit', prompt: text, ...o }); }
+      } catch (e) { toast(e.message); }
     };
     if ($('#regen')) $('#regen').onclick = () => startRun({ type: 'generate', prompt: st.data.project.prompt, ...opts() });
   }
 
   // ----- 运行任务（流式进度） -----
+  const GEN_STEPS = [
+    { id: 'plan', label: '需求拆解' },
+    { id: 'build', label: '并行生成' },
+    { id: 'qa', label: '静态评分' },
+    { id: 'runtime', label: '运行时检查' },
+    { id: 'done', label: '完成' },
+  ];
+  const EDIT_STEPS = [
+    { id: 'edit', label: '生成补丁' },
+    { id: 'qa', label: '应用补丁/QA' },
+    { id: 'runtime', label: '运行时检查' },
+    { id: 'done', label: '完成' },
+  ];
+  function stepLabel(s, r) {
+    if (s.id === 'build') return r.laneCount > 0 ? `并行生成 (${r.laneCount} 路)` : '并行生成';
+    return s.label;
+  }
   function progressEl() {
     const el = document.createElement('div');
     el.className = 'progress';
-    el.innerHTML = `<div class="row"><span class="spinner"></span><span class="stage" id="pStage">准备中…</span><span class="timer" id="pTimer">0s / 120s</span></div><div class="lanes" id="pLanes"></div><div class="logs" id="pLogs"></div>`;
+    el.innerHTML = `<div class="row"><span class="spinner"></span><span class="stage">准备中…</span><span class="timer">0s / 120s</span></div><div class="stepper"></div><div class="lanes"></div><div class="logs"></div>`;
     return el;
   }
+  function laneExpect(l) { return l.lane === 'P' ? 1200 : l.lane === 'E' ? 2500 : 9000; }
+  function laneElapsed(l) {
+    const base = l.elapsed || 0;
+    if (!l._at || l.status === 'done' || l.status === 'failed' || l.status === 'stopped') return base;
+    return base + (Date.now() - l._at);
+  }
+  function laneStatusText(l) {
+    const map = { queued: '排队', running: '思考中', thinking: '思考中', coding: '编写代码', done: '已完成', failed: '失败', stopped: '已中止' };
+    const base = map[l.status] || '排队';
+    return l.status === 'done' && l.score != null ? `${base} ${l.score} 分` : base;
+  }
   function laneHtml(l) {
-    const stText = { running: '启动中', thinking: '思考中…', coding: '编码中…', done: `✅ ${l.score ?? ''} 分`, failed: '❌ 失败' }[l.status] || l.status;
-    return `<div class="lh"><b>${l.lane === 'E' ? '增量补丁' : '方案 ' + esc(l.lane)}</b><span class="muted">${esc(l.name || '')}</span><span class="muted">${l.chars ? l.chars + ' 字符' : ''}${l.model ? ' · ' + esc(l.model) : ''}${l.channel === 'backup' ? '（备用）' : ''}</span><span class="st">${stText}</span></div>
-      ${l.status === 'failed' && l.error ? `<div class="small" style="color:var(--bad)">${esc(l.error)}</div>` : ''}${l.tail ? `<pre>${esc(l.tail)}</pre>` : ''}`;
+    const sec = Math.max(0, Math.round(laneElapsed(l) / 1000));
+    const chars = l.chars || 0;
+    const cps = sec > 0 ? Math.round(chars / sec) : (l.cps || 0);
+    const pct = l.status === 'done' ? 100 : Math.min(95, Math.round((chars / laneExpect(l)) * 100));
+    const label = l.lane === 'P' ? '规划' : l.lane === 'E' ? '补丁' : '方案 ' + (l.lane || '');
+    // 默认只在正在输出时展开。用户点过 summary 之后以 userTail 为准（完成也不再自动展开）
+    const streaming = l.status === 'thinking' || l.status === 'coding' || l.status === 'running';
+    const open = l.userTail != null ? !!l.userTail : streaming;
+    const tail = l.tail ? String(l.tail).slice(-400) : '';
+    return `<div class="lh"><b>${esc(label)}</b>${l.name ? `<span class="muted">${esc(l.name)}</span>` : ''}${l.channel === 'backup' ? '<span class="muted">备用</span>' : ''}<span class="st">${esc(laneStatusText(l))}</span></div>
+      <div class="meta"><span>${esc(l.model || '…')}</span><span>${chars} 字符</span><span data-cps>${cps} 字/秒</span><span data-sec>${sec}s</span></div>
+      <div class="track"><i data-bar style="width:${pct}%"></i></div>
+      ${l.error && (l.status === 'failed' || l.status === 'stopped') ? `<div class="small" style="color:var(--bad);margin-top:4px">${esc(l.error)}</div>` : ''}
+      ${tail ? `<details class="tail" ${open ? 'open' : ''}><summary>实时代码</summary><pre>${esc(tail)}</pre></details>` : ''}`;
+  }
+  function paintStepper() {
+    const r = st.running; if (!r) return;
+    const box = $('.stepper', r.el); if (!box) return;
+    const steps = r.type === 'edit' ? EDIT_STEPS : GEN_STEPS;
+    let idx = steps.findIndex((s) => s.id === r.stageId);
+    if (idx < 0) idx = 0;
+    const elSec = Math.max(0, Math.floor((Date.now() - (r.stageAt || r.started)) / 1000));
+    box.innerHTML = steps.map((s, i) => {
+      const cls = i < idx ? 'ok' : i === idx ? 'on' : '';
+      const extra = i === idx && s.id !== 'done' ? ` ${elSec}s` : '';
+      const arrow = i < steps.length - 1 ? '<span class="step-arr">→</span>' : '';
+      return `<span class="step ${cls}">${i < idx ? '✓ ' : ''}${esc(stepLabel(s, r))}${extra}</span>${arrow}`;
+    }).join('');
+  }
+  function paintLaneTimes() {
+    const r = st.running; if (!r) return;
+    const box = $('.lanes', r.el); if (!box) return;
+    for (const l of Object.values(r.lanes)) {
+      const el = box.querySelector(`[data-lane="${l.lane}"]`);
+      if (!el) continue;
+      const sec = Math.max(0, Math.round(laneElapsed(l) / 1000));
+      const chars = l.chars || 0;
+      const cps = sec > 0 ? Math.round(chars / sec) : 0;
+      const pct = l.status === 'done' ? 100 : Math.min(95, Math.round((chars / laneExpect(l)) * 100));
+      const a = el.querySelector('[data-sec]'); if (a) a.textContent = sec + 's';
+      const b = el.querySelector('[data-cps]'); if (b) b.textContent = cps + ' 字/秒';
+      const c = el.querySelector('[data-bar]'); if (c) c.style.width = pct + '%';
+    }
+  }
+  function paintLanes() {
+    const r = st.running; if (!r) return;
+    const box = $('.lanes', r.el); if (!box) return;
+    Object.values(r.lanes).forEach((l) => {
+      let el = box.querySelector(`[data-lane="${l.lane}"]`);
+      if (!el) { el = document.createElement('div'); el.className = 'lane'; el.dataset.lane = l.lane; box.appendChild(el); }
+      el.className = 'lane ' + (l.status === 'done' ? 'done' : (l.status === 'failed' || l.status === 'stopped') ? 'failed' : '');
+      el.innerHTML = laneHtml(l);
+      const det = el.querySelector('details.tail');
+      const sum = det && det.querySelector('summary');
+      // 点 summary 时 open 还是点击前的值。不用 toggle：插入 <details open> 会异步派发且 isTrusted 的 toggle
+      if (sum) sum.addEventListener('click', () => { l.userTail = !det.open; });
+    });
   }
   function onEvent(ev, d) {
     const r = st.running; if (!r) return;
     if (ev === 'job') r.jobId = d.id;
-    if (ev === 'stage') { $('#pStage', r.el).textContent = d.text; if (d.lanes) d.lanes.forEach((l) => (r.lanes[l.id] = { lane: l.id, name: l.name, status: 'running' })); paintLanes(); }
-    if (ev === 'lane') { r.lanes[d.lane] = { ...(r.lanes[d.lane] || {}), ...d }; paintLanes(); }
-    if (ev === 'log') { const lg = $('#pLogs', r.el); const div = document.createElement('div'); div.className = d.level; div.textContent = `${d.lane ? '[' + d.lane + '] ' : ''}${d.text}`; lg.appendChild(div); lg.scrollTop = lg.scrollHeight; }
+    if (ev === 'stage') {
+      let stageChanged = false;
+      if (d.stage && d.stage !== r.stageId) { r.stageId = d.stage; r.stageAt = d.at || Date.now(); stageChanged = true; }
+      const stage = $('.stage', r.el); if (stage && d.text) stage.textContent = d.text;
+      if (d.lanes && d.lanes.length) {
+        r.laneCount = d.lanes.length;
+        d.lanes.forEach((l) => { r.lanes[l.id] = { ...(r.lanes[l.id] || {}), lane: l.id, name: l.name, status: (r.lanes[l.id] && r.lanes[l.id].status) || 'queued' }; });
+      }
+      paintLanes(); paintStepper();
+      if (stageChanged) pinToProgress();
+    }
+    if (ev === 'lane') {
+      const prev = r.lanes[d.lane] || {};
+      const next = { ...prev, ...d, _at: Date.now() };
+      if (d.tail == null && prev.tail) next.tail = prev.tail;
+      r.lanes[d.lane] = next;
+      paintLanes();
+    }
+    if (ev === 'log') { const lg = $('.logs', r.el); if (!lg) return; const div = document.createElement('div'); div.className = d.level || ''; div.textContent = `${d.lane ? '[' + d.lane + '] ' : ''}${d.text}`; lg.appendChild(div); lg.scrollTop = lg.scrollHeight; }
     if (ev === 'message') { st.data.messages.push(d); renderMessages(); }
     if (ev === 'done') r.done = d;
   }
-  function paintLanes() {
-    const r = st.running; const box = $('#pLanes', r.el);
-    Object.values(r.lanes).forEach((l) => {
-      let el = box.querySelector(`[data-lane="${l.lane}"]`);
-      if (!el) { el = document.createElement('div'); el.className = 'lane'; el.dataset.lane = l.lane; box.appendChild(el); }
-      el.className = 'lane ' + (l.status === 'done' ? 'done' : l.status === 'failed' ? 'failed' : '');
-      el.innerHTML = laneHtml(l);
-    });
-    msgsEl.scrollTop = msgsEl.scrollHeight;
+  function applySnapshot(r, progress) {
+    if (!progress) return;
+    const prevStage = r.stageId;
+    if (progress.stage && progress.stage !== r.stageId) { r.stageId = progress.stage; r.stageAt = progress.stageStartedAt || Date.now(); }
+    if (progress.laneCount) r.laneCount = progress.laneCount;
+    if (progress.type) r.type = progress.type === 'edit' ? 'edit' : 'generate';
+    const stage = $('.stage', r.el);
+    if (stage && progress.stageText) stage.textContent = progress.stageText;
+    for (const [k, v] of Object.entries(progress.lanes || {})) {
+      const prev = r.lanes[k] || {};
+      r.lanes[k] = { ...prev, ...v, _at: Date.now(), tail: prev.tail, userTail: prev.userTail };
+    }
+    paintLanes(); paintStepper();
+    if (progress.stage && progress.stage !== prevStage) pinToProgress();
+  }
+  async function performRuntimeCheck(jobId) {
+    if (!jobId || st.checkingThis === jobId) return false;
+    st.checkingThis = jobId;
+    try {
+      const d = await api('/api/projects/' + id);
+      if (!alive) return false;
+      const targets = (d.versions || []).filter((v) => v.job_id === jobId);
+      if (!targets.length) return false;
+      const reports = await Promise.all(targets.map(async (v) => {
+        const full = await api('/api/versions/' + v.id);
+        const rep = await probeHtml(full.html, v.id);
+        return { versionId: v.id, ...rep };
+      }));
+      if (!alive) return false;
+      const real = reports.filter((rep) => !rep.timeout);
+      if (!real.length) { st.checkingThis = null; return false; }
+      await api(`/api/projects/${id}/runtime-check`, { method: 'POST', body: { jobId, reports: real } });
+      return true;
+    } catch (e) {
+      st.checkingThis = null;
+      throw e;
+    }
+  }
+  async function enterRuntime(r, jobId) {
+    r.stageId = 'runtime'; r.stageAt = Date.now();
+    const stage = $('.stage', r.el); if (stage) stage.textContent = '正在隐藏沙箱里做运行时检查…';
+    paintStepper();
+    pinToProgress();
+    st.checkingRuntime = true;
+    let checked = false;
+    try { checked = await performRuntimeCheck(jobId); } catch (e) { console.error(e); }
+    st.checkingRuntime = false;
+    if (st.running === r) { r.stageId = 'done'; r.stageAt = Date.now(); paintStepper(); pinToProgress(); }
+    return checked;
   }
 
   async function startRun(body) {
     if (st.running) return;
+    st.follow = true;
     const ctrl = new AbortController();
-    const r = st.running = { el: progressEl(), lanes: {}, started: Date.now(), ctrl, jobId: null, done: null };
+    const r = st.running = {
+      el: progressEl(), lanes: {}, started: Date.now(), ctrl, jobId: null, done: null,
+      type: body.type === 'edit' ? 'edit' : 'generate',
+      stageId: body.type === 'edit' ? 'edit' : 'plan',
+      stageAt: Date.now(),
+      laneCount: body.type === 'edit' ? 1 : (body.lanes || 2),
+    };
     st.data.messages.push({ id: 'tmp', role: 'user', content: body.prompt, meta: body, created_at: Date.now() });
-    renderMessages(); renderComposer();
+    renderMessages(); renderComposer(); paintStepper();
     r.tick = setInterval(() => {
       const s = Math.floor((Date.now() - r.started) / 1000);
-      const t = $('#pTimer', r.el); if (t) t.textContent = `${s}s / 120s`;
+      const t = $('.timer', r.el); if (t) t.textContent = `${s}s / 120s`;
+      paintStepper(); paintLaneTimes();
       if (s > 160) ctrl.abort(); // 前端兜底：服务端预算 120s，超过 160s 视为连接异常
     }, 500);
+    let checked = false;
     try {
       await streamRun(`/api/projects/${id}/run`, { ...body, baseVersionId: st.data.project.currentVersionId }, onEvent, ctrl.signal);
     } catch (e) {
@@ -417,31 +730,55 @@ async function viewProject(app, id) {
     } finally {
       clearInterval(r.tick);
       const done = r.done;
+      const jobId = r.jobId;
+      if (alive && done && done.status === 'done' && jobId && st.running) checked = await enterRuntime(r, jobId);
+      const demoMode = done && done.status === 'done' && done.mode === 'demo';
       st.running = null;
-      await refresh(done && done.versionId ? done.versionId : null);
-      if (done && done.status === 'done' && done.mode === 'demo') toast('模型不可用或已开启演示模式：已使用内置模板 / 规则引擎完成');
+      if (!alive) return;
+      await refresh(checked ? null : (done && done.versionId ? done.versionId : null));
+      if (demoMode) toast('模型不可用或已开启演示模式：已使用内置模板 / 规则引擎完成');
     }
   }
   async function cancelRun() {
     const r = st.running; if (!r) return;
-    $('#pStage', r.el).textContent = '正在取消…';
+    const stage = $('.stage', r.el); if (stage) stage.textContent = '正在取消…';
     if (r.jobId) await api(`/api/jobs/${r.jobId}/cancel`, { method: 'POST' }).catch(() => {});
-    setTimeout(() => { if (st.running === r) r.ctrl.abort(); }, 6000);
+    setTimeout(() => { if (st.running === r && r.ctrl) r.ctrl.abort(); }, 6000);
   }
 
-  // 刷新页面后恢复后台任务
+  // 刷新页面后恢复后台任务（用任务上的进度快照画出阶段和字符数）
   async function resumeJob(job) {
-    const r = st.running = { el: progressEl(), lanes: {}, started: job.createdAt, ctrl: new AbortController(), jobId: job.id };
+    st.follow = true;
+    const prog = (job.detail && job.detail.progress) || {};
+    const r = st.running = {
+      el: progressEl(), lanes: {}, started: job.createdAt, ctrl: null, jobId: job.id,
+      type: job.type === 'edit' ? 'edit' : 'generate',
+      stageId: prog.stage || (job.type === 'edit' ? 'edit' : 'plan'),
+      stageAt: prog.stageStartedAt || job.createdAt,
+      laneCount: prog.laneCount || (job.type === 'edit' ? 1 : 2),
+    };
     renderMessages(); renderComposer();
-    $('#pStage', r.el).textContent = '任务仍在后台运行（已从刷新中恢复）…';
+    applySnapshot(r, prog);
+    const stage = $('.stage', r.el);
+    if (stage && !prog.stageText) stage.textContent = '任务仍在后台运行（已从刷新中恢复）…';
+    paintStepper();
     r.tick = setInterval(async () => {
+      if (!st.running || st.running !== r) return;
       const s = Math.floor((Date.now() - r.started) / 1000);
-      const t = $('#pTimer', r.el); if (t) t.textContent = `${s}s / 120s`;
+      const t = $('.timer', r.el); if (t) t.textContent = `${s}s / 120s`;
+      paintStepper(); paintLaneTimes();
       if (s % 2) return;
       try {
         const { job: j } = await api('/api/jobs/' + job.id);
-        if (j.status !== 'running' && j.status !== 'canceling') { clearInterval(r.tick); st.running = null; await refresh(); }
-      } catch { clearInterval(r.tick); st.running = null; await refresh(); }
+        if (!alive || st.running !== r) return;
+        if (j.detail && j.detail.progress) applySnapshot(r, j.detail.progress);
+        if (j.status !== 'running' && j.status !== 'canceling') {
+          clearInterval(r.tick);
+          if (j.status === 'done') await enterRuntime(r, job.id);
+          st.running = null;
+          if (alive) await refresh();
+        }
+      } catch { clearInterval(r.tick); st.running = null; if (alive) await refresh(); }
     }, 1000);
   }
 
@@ -467,7 +804,7 @@ async function viewProject(app, id) {
   function renderStage() {
     $$('#tabs button').forEach((b) => b.classList.toggle('on', b.dataset.t === st.tab));
     const v = currentVersion();
-    $('#vinfo').innerHTML = v ? `v${v.n}${v.candidate ? '（候选）' : ''} ${modeTag(v.mode)} ${v.score != null ? `<span class="tag">评分 ${v.score}</span>` : ''} ${v.id !== st.data.project.currentVersionId ? `<span class="tag backup">非当前版本</span>${owner ? ` <button class="btn sm" id="useThis">设为当前</button>` : ''}` : ''}` : '';
+    $('#vinfo').innerHTML = v ? `v${v.n}${v.candidate ? '（候选）' : ''} ${modeTag(v.mode)} ${scoreTags(v)} ${v.id !== st.data.project.currentVersionId ? `<span class="tag backup">非当前版本</span>${owner ? ` <button class="btn sm" id="useThis">设为当前</button>` : ''}` : ''}` : '';
     if ($('#useThis')) $('#useThis').onclick = () => adopt(v.id);
     const stage = $('#stage');
     stage.innerHTML = '';
@@ -488,7 +825,7 @@ async function viewProject(app, id) {
       const list = [...st.data.versions].reverse();
       box.innerHTML = list.length ? list.map((x) => `<div class="vrow ${x.id === st.data.project.currentVersionId ? 'cur' : ''} ${x.candidate ? 'cand' : ''}">
         <span class="n">v${x.n}</span><span class="note">${esc(x.note || '')}<br><span class="muted small">${fmtTime(x.created_at)} · ${x.size} 字符${x.model ? ' · ' + esc(x.model) : ''}</span></span>
-        ${modeTag(x.mode)}${x.score != null ? `<span class="tag">评分 ${x.score}</span>` : ''}${x.candidate ? '<span class="tag">候选</span>' : ''}${x.id === st.data.project.currentVersionId ? '<span class="tag preset">当前</span>' : ''}
+        ${modeTag(x.mode)}${scoreTags(x)}${x.candidate ? '<span class="tag">候选</span>' : ''}${x.id === st.data.project.currentVersionId ? '<span class="tag preset">当前</span>' : ''}
         <button class="btn sm" data-view="${x.id}">预览</button>${owner && x.id !== st.data.project.currentVersionId ? `<button class="btn sm" data-adopt="${x.id}">${x.candidate ? '采用' : '回滚到此版'}</button>` : ''}</div>`).join('') : '<div class="empty">暂无版本</div>';
       stage.appendChild(box);
       $$('[data-view]', box).forEach((b) => (b.onclick = () => showVersion(b.dataset.view)));
@@ -497,6 +834,7 @@ async function viewProject(app, id) {
   }
 
   WS.onRuntimeError = (frame, d) => {
+    if (st.checkingRuntime || frame.dataset.probe === '1') return;
     if (frame.dataset.pid !== id || st.tab !== 'preview' || st.runtimeError) return;
     st.runtimeError = d;
     const vp = $('.viewport'); if (!vp) return;
@@ -529,14 +867,28 @@ async function viewProject(app, id) {
   }
 
   renderMessages(); renderComposer(); renderStage();
-  cleanup = () => { WS.onRuntimeError = null; if (st.running) { clearInterval(st.running.tick); } };
+  cleanup = () => { alive = false; WS.onRuntimeError = null; if (st.running) { clearInterval(st.running.tick); } document.querySelectorAll('iframe[data-probe="1"]').forEach((f) => f.remove()); };
 
-  // 自动开始（从首页进入）或恢复后台任务
+  // 自动开始（从首页进入）、恢复后台任务，或补跑尚未回传的运行时检查
   const auto = JSON.parse(sessionStorage.getItem('atoms_autostart') || 'null');
   if (auto && auto.id === id && owner) {
     sessionStorage.removeItem('atoms_autostart');
     if (!data.project.currentVersionId && !data.activeJob) startRun({ type: 'generate', prompt: auto.prompt, lanes: auto.lanes, model: auto.model, demo: auto.demo, simulate: auto.simulate });
   } else if (data.activeJob && owner) resumeJob(data.activeJob);
+  else if (data.pendingRuntime && owner) {
+    const pr = data.pendingRuntime;
+    const r = st.running = {
+      el: progressEl(), lanes: {}, started: Date.now(), ctrl: null, jobId: pr.id,
+      type: pr.type === 'edit' ? 'edit' : 'generate', stageId: 'runtime', stageAt: Date.now(), laneCount: 1,
+    };
+    renderMessages(); renderComposer();
+    const stage = $('.stage', r.el); if (stage) stage.textContent = '正在补做运行时检查…';
+    paintStepper();
+    enterRuntime(r, pr.id).catch((e) => console.error(e)).finally(async () => {
+      st.running = null;
+      if (alive) await refresh();
+    });
+  }
 }
 
 // ---------------- 启动 ----------------

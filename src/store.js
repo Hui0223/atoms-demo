@@ -2,7 +2,8 @@
 import { DurableObject } from 'cloudflare:workers';
 import sources from './templates/sources.js';
 import { renderTemplate } from './templates/engine.js';
-import { scoreHtml } from './lib/qa.js';
+import { scoreHtml, applyRuntime } from './lib/qa.js';
+import { LANE_VARIANTS } from './agents/prompts.js';
 import { startRun } from './runner.js';
 
 const SCHEMA = `
@@ -126,7 +127,7 @@ export class AppStore extends DurableObject {
       .map((m) => ({ ...m, meta: m.meta ? JSON.parse(m.meta) : null }));
     const current = p.current_version_id ? this.one('SELECT html FROM versions WHERE id=?', p.current_version_id) : null;
     const job = this.activeJob(id);
-    return { project: this.projectSummary(p), versions, messages, html: current?.html || '', activeJob: job };
+    return { project: this.projectSummary(p), versions, messages, html: current?.html || '', activeJob: job, pendingRuntime: this.runtimeHint(id) };
   }
   updateProject(id, { title, isPublic }) {
     if (title !== undefined) this.sql.exec('UPDATE projects SET title=?, updated_at=? WHERE id=?', String(title).slice(0, 60), now(), id);
@@ -181,7 +182,13 @@ export class AppStore extends DurableObject {
     return { job: { id, status: 'running', type } };
   }
   updateJob(id, status, detail) {
-    this.sql.exec('UPDATE jobs SET status=COALESCE(?,status), detail=COALESCE(?,detail), updated_at=? WHERE id=?', status || null, detail ? JSON.stringify(detail) : null, now(), id);
+    let payload = null;
+    if (detail) {
+      let prev = {};
+      try { prev = JSON.parse(this.one('SELECT detail FROM jobs WHERE id=?', id)?.detail || '{}') || {}; } catch {}
+      payload = prev && typeof prev === 'object' && !Array.isArray(prev) ? { ...prev, ...detail } : detail;
+    }
+    this.sql.exec('UPDATE jobs SET status=COALESCE(?,status), detail=COALESCE(?,detail), updated_at=? WHERE id=?', status || null, payload ? JSON.stringify(payload) : null, now(), id);
     if (status && status !== 'running') {
       const j = this.one('SELECT project_id FROM jobs WHERE id=?', id);
       if (j) this.sql.exec('UPDATE projects SET updated_at=? WHERE id=?', now(), j.project_id);
@@ -198,6 +205,112 @@ export class AppStore extends DurableObject {
     if (!j) return null;
     const job = this.getJob(j.id);
     return job && (job.status === 'running' || job.status === 'canceling') ? job : null;
+  }
+  // 意图分类用：标题 / 原始需求 / 最近一次规划，不带 HTML
+  projectContext(id) {
+    const p = this.getProjectRow(id);
+    if (!p) return null;
+    let plan = null;
+    const rows = this.q("SELECT meta FROM messages WHERE project_id=? AND agent='planner' ORDER BY created_at DESC LIMIT 5", id);
+    for (const r of rows) {
+      if (!r.meta) continue;
+      try { const m = JSON.parse(r.meta); if (m && m.plan) { plan = m.plan; break; } } catch {}
+    }
+    return { title: p.title, prompt: p.prompt, plan };
+  }
+  // 刚结束、还没做过运行时检查的任务（刷新后补跑）
+  runtimeHint(projectId) {
+    const j = this.one('SELECT id FROM jobs WHERE project_id=? ORDER BY created_at DESC LIMIT 1', projectId);
+    if (!j) return null;
+    const job = this.getJob(j.id);
+    if (!job || job.status !== 'done') return null;
+    const d = job.detail || {};
+    if (d.needsRuntime && !d.runtimeChecked) return { id: job.id, type: job.type };
+    return null;
+  }
+  applyRuntimeCheck(projectId, { jobId, reports }) {
+    const job = this.getJob(jobId);
+    if (!job || job.projectId !== projectId) return { error: '任务不存在' };
+    if (job.detail?.runtimeChecked) return { ignored: true };
+    const list = (Array.isArray(reports) ? reports : []).slice(0, 8).map((r) => {
+      if (!r || !r.versionId || r.timeout) return null;
+      const errors = (Array.isArray(r.errors) ? r.errors : []).slice(0, 12).map((e) => ({
+        message: String((e && e.message) || '').trim().slice(0, 300),
+        line: e && e.line ? (e.line | 0) : 0,
+      })).filter((e) => e.message);
+      return { versionId: String(r.versionId), errors, blank: !!r.blank, textLen: r.textLen | 0, nodes: r.nodes | 0 };
+    }).filter(Boolean);
+    if (!list.length) return { inconclusive: true };
+    const versions = this.q('SELECT * FROM versions WHERE project_id=? AND job_id=? ORDER BY created_at ASC', projectId, jobId);
+    const byId = new Map(versions.map((v) => [v.id, v]));
+    const updated = [];
+    for (const rep of list) {
+      const v = byId.get(rep.versionId);
+      if (!v) continue;
+      let prev = { total: v.score || 0, items: [], qa: { ok: true, issues: [] } };
+      try { if (v.score_json) prev = JSON.parse(v.score_json); } catch {}
+      const next = applyRuntime(prev, rep);
+      this.sql.exec('UPDATE versions SET score=?, score_json=? WHERE id=?', next.total, JSON.stringify(next), v.id);
+      updated.push({ row: { ...v, score_json: JSON.stringify(next) }, score: next });
+    }
+    if (!updated.length) return { inconclusive: true };
+    const laneName = (id) => (LANE_VARIANTS.find((x) => x.id === id) || {}).name || '';
+    const labelOf = (rt) => !rt ? '—' : rt.blank ? '⚪ 白屏' : rt.errorCount > 0 ? `❌ ${rt.errorCount} 个错误` : '✅';
+    const proj = this.getProjectRow(projectId);
+    const isEdit = job.type === 'edit';
+    const winner = updated.find((u) => u.row.id === proj.current_version_id) || updated.find((u) => !u.row.candidate) || updated[0];
+    const clean = updated.filter((u) => u.row.candidate && u.score.runtime.clean).sort((a, b) => b.score.total - a.score.total);
+    const winnerDirty = winner && !winner.score.runtime.clean;
+    let switched = false, newVersionId = null, note = '';
+    if (!isEdit && winnerDirty && clean.length && clean[0].score.total > winner.score.total) {
+      const best = clean[0];
+      const wLane = winner.row.lane || 'A';
+      const bLane = best.row.lane || 'B';
+      note = winner.score.runtime.blank ? `运行时检查：方案 ${wLane} 白屏，自动改用方案 ${bLane}` : `运行时检查：方案 ${wLane} 报错，自动改用方案 ${bLane}`;
+      newVersionId = this.adoptVersion(projectId, best.row.id, note);
+      switched = true;
+    }
+    const winLane = switched ? clean[0].row.lane : winner?.row.lane;
+    const board = updated.map((u) => ({
+      lane: u.row.lane || (isEdit ? 'E' : '-'),
+      name: laneName(u.row.lane) || (u.row.kind === 'fallback' ? '模板' : isEdit ? '本次修改' : ''),
+      ok: true,
+      score: u.score.total,
+      staticScore: u.score.staticTotal,
+      finalScore: u.score.total,
+      runtimeLabel: labelOf(u.score.runtime),
+      items: u.score.items,
+      model: u.row.model || '-',
+      ms: 0,
+      error: u.score.runtime.clean ? null : (u.score.runtime.blank ? '白屏' : (u.score.runtime.errors[0]?.message || '运行时错误')),
+    }));
+    let content = '';
+    if (isEdit) {
+      if (winnerDirty) {
+        const rt = winner.score.runtime;
+        content = rt.blank ? '运行时检查未通过：页面白屏。可在预览里点「让 AI 修复」。' : `运行时检查未通过：${rt.errorCount} 个错误。可在预览里点「让 AI 修复」。`;
+      }
+    } else if (switched) {
+      content = `${note}（最终 ${clean[0].score.total} 分）。`;
+    } else if (updated.every((u) => !u.score.runtime.clean)) {
+      content = `运行时检查：全部方案都有运行时问题。已保留当前方案${winLane ? ' ' + winLane : ''}，可在预览里点「让 AI 修复」。`;
+    } else if (winnerDirty) {
+      content = `运行时检查：当前方案存在运行时问题，其他方案分数未超过它，暂时保留。可在预览里点「让 AI 修复」。`;
+    } else {
+      content = `运行时检查通过${winLane ? '：方案 ' + winLane + ' 无报错' : ''}（最终 ${winner.score.total} 分）。`;
+    }
+    if (content) {
+      const meta = {
+        runtime: true,
+        board,
+        winner: winLane || null,
+        versionId: newVersionId || winner?.row.id || null,
+        candidates: isEdit ? [] : updated.filter((u) => u.row.candidate && u.row.lane !== winLane).map((u) => ({ id: u.row.id, lane: u.row.lane, name: laneName(u.row.lane), score: u.score.total })),
+      };
+      this.addMessage(projectId, 'agent', 'qa', content, meta);
+    }
+    this.updateJob(jobId, null, { runtimeChecked: true, needsRuntime: false });
+    return { ok: true, switched, versionId: newVersionId || null };
   }
   cancelJob(id) { this.sql.exec("UPDATE jobs SET status='canceling', updated_at=? WHERE id=? AND status='running'", now(), id); }
   isCanceled(id) {

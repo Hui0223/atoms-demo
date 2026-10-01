@@ -21,6 +21,15 @@ export function escapeHtml(s) {
   return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
+// 故障演练：在静态评分之后塞进会抛错的脚本，让方案 A 静态分仍可能领先
+export function injectRuntimeFault(html, message = '故障演练：方案 A 运行时错误') {
+  const bomb = `<script>throw new Error(${JSON.stringify(String(message))})</script>`;
+  const src = String(html || '');
+  const pos = src.toLowerCase().lastIndexOf('</body>');
+  if (pos === -1) return src + bomb;
+  return src.slice(0, pos) + bomb + src.slice(pos);
+}
+
 // 宽松 JSON 解析：取第一个 {...} 块
 export function parseLooseJson(text) {
   if (!text) return null;

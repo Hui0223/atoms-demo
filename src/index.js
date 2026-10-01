@@ -1,9 +1,11 @@
 // Atoms Demo —— Cloudflare Worker 入口：静态资源 + REST/流式 API + 分享页
 import { AppStore } from './store.js';
 import { hashPassword, verifyPassword, newToken, validateCredentials } from './lib/auth.js';
-import { catalog } from './agents/models.js';
+import { catalog, channelsFor } from './agents/models.js';
+import { resilientChat } from './agents/llm.js';
 import { injectShim } from '../public/shim.js';
-import { escapeHtml } from './lib/html.js';
+import { escapeHtml, parseLooseJson } from './lib/html.js';
+import { classifyIntent } from './lib/intent.js';
 
 export { AppStore };
 
@@ -118,6 +120,54 @@ route('POST', '/api/projects/:id/fork', async (req, env, { user, params }) => {
   return id ? json({ id }) : err('该作品暂无可复制的版本');
 }, { auth: true });
 
+// 规则分不清时，最多问一次模型（短输出、8s 预算）；失败或超时保持 unsure
+async function modelIntent(env, text, ctx) {
+  const plan = ctx?.plan ? JSON.stringify(ctx.plan).slice(0, 400) : '';
+  const r = await resilientChat(env, {
+    messages: [
+      { role: 'system', content: '判断用户的新消息是要修改「当前应用」还是要做「一个全新的应用」。只输出 JSON：{"intent":"new"} 或 {"intent":"edit"}。不要解释，不要思考。' },
+      { role: 'user', content: `当前应用：${ctx?.title || ''}\n原需求：${String(ctx?.prompt || '').slice(0, 200)}\n规格：${plan}\n新消息：${String(text).slice(0, 500)}` },
+    ],
+    maxTokens: 400, temperature: 0, deadline: Date.now() + 8000,
+  }, { channels: channelsFor(env, 'deepseek', { attempts: 1, backupAttempts: 0 }), simulate: 'none' });
+  const j = parseLooseJson(r.text);
+  return j && (j.intent === 'new' || j.intent === 'edit') ? j.intent : null;
+}
+
+route('POST', '/api/projects/:id/intent', async (req, env, { user, params }) => {
+  const r = await loadOwned(env, user, params.id);
+  if (r.error) return r.error;
+  const body = await readJson(req);
+  const text = String(body.prompt || '').trim();
+  if (!text) return err('请输入内容');
+  if (text.length > 2000) return err('输入请控制在 2000 字以内');
+  const ctx = await db(env).projectContext(params.id) || { title: r.row.title, prompt: r.row.prompt };
+  let result = { ...classifyIntent(text, ctx), source: 'rules' };
+  const configured = env.AI_DISABLED !== '1' && env.ANTHROPIC_AUTH_TOKEN && env.ANTHROPIC_BASE_URL;
+  if (result.intent === 'unsure' && configured) {
+    let settled = false;
+    try {
+      const intent = await Promise.race([
+        modelIntent(env, text, ctx).then((v) => { settled = true; return v; }),
+        new Promise((resolve) => setTimeout(() => resolve(settled ? undefined : null), 10000)),
+      ]);
+      if (intent === 'new' || intent === 'edit') result = { intent, confidence: 0.86, reason: (result.reason ? result.reason + '；' : '') + '模型判别', source: 'model' };
+    } catch { /* 保持规则给出的 unsure */ }
+  }
+  return json(result);
+}, { auth: true });
+
+route('POST', '/api/projects/:id/runtime-check', async (req, env, { user, params }) => {
+  const r = await loadOwned(env, user, params.id);
+  if (r.error) return r.error;
+  const body = await readJson(req);
+  const job = await db(env).getJob(String(body.jobId || ''));
+  if (!job || job.userId !== user.id || job.projectId !== params.id) return err('任务不存在', 404);
+  const out = await db(env).applyRuntimeCheck(params.id, { jobId: job.id, reports: body.reports });
+  if (out.error) return err(out.error, 400);
+  return json(out);
+}, { auth: true });
+
 route('POST', '/api/projects/:id/adopt', async (req, env, { user, params }) => {
   const r = await loadOwned(env, user, params.id);
   if (r.error) return r.error;
@@ -158,6 +208,7 @@ route('POST', '/api/projects/:id/run', async (req, env, { user, params }) => {
   const r = await loadOwned(env, user, params.id);
   if (r.error) return r.error;
   const body = await readJson(req);
+  // 新应用 / 修改由 /intent 决定；这里 edit 一律增量，不会整页重生成
   const type = body.type === 'edit' ? 'edit' : 'generate';
   const text = String(body.prompt || '').trim();
   if (!text) return err('请输入内容');

@@ -123,7 +123,8 @@ export async function streamChat(env, { model, messages, maxTokens = 4096, tempe
 /**
  * 带重试和备用通道的调用
  * channels: [{ model, label, attempts }]
- * simulate: 'none' | 'primary429' | 'alldown'  —— 故障演练开关，用于验证降级链路
+ * simulate: 'none' | 'primary429' | 'alldown'
+ * runtimeError 等其他值在这里忽略，故障演练的运行时注入不走模型调用
  */
 export async function resilientChat(env, opts, { channels, simulate = 'none', log = () => {} }) {
   let lastErr;

@@ -2,10 +2,11 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { parsePatches, applyPatches } from '../src/lib/patch.js';
-import { qaCheck, scoreHtml, bracketsBalanced } from '../src/lib/qa.js';
-import { extractHtml, parseLooseJson } from '../src/lib/html.js';
+import { qaCheck, scoreHtml, bracketsBalanced, applyRuntime } from '../src/lib/qa.js';
+import { extractHtml, parseLooseJson, injectRuntimeFault } from '../src/lib/html.js';
+import { classifyIntent } from '../src/lib/intent.js';
 import { pickTemplate, renderTemplate, demoEdit } from '../src/templates/engine.js';
-import { injectShim } from '../public/shim.js';
+import { injectShim, buildShim } from '../public/shim.js';
 
 const sources = Object.fromEntries(['kanban', 'mortgage', 'profile', 'pomodoro', 'generic'].map((k) => [k, readFileSync(new URL(`../src/templates/${k}.html`, import.meta.url), 'utf8')]));
 
@@ -82,6 +83,77 @@ test('预览沙箱 shim 注入到 <head> 之后', () => {
 });
 
 import { injectDesignSystem, stripDesignSystem } from '../src/lib/designSystem.js';
+
+const pomo = { title: '番茄钟', prompt: '番茄钟专注计时器，可以管理今日任务并统计近 7 天专注数', plan: { title: '番茄钟', features: ['专注计时', '今日任务', '近7天统计'] } };
+
+test('intent: 全新需求 / 增量修改 / 混合', () => {
+  const neu = classifyIntent('做一个记账本应用', pomo);
+  assert.equal(neu.intent, 'new');
+  assert.ok(neu.confidence >= 0.75);
+  const again = classifyIntent('再做一个贪吃蛇小游戏', pomo);
+  assert.equal(again.intent, 'new');
+  assert.ok(again.confidence >= 0.75);
+  assert.equal(classifyIntent('把主色改成蓝色', pomo).intent, 'edit');
+  assert.equal(classifyIntent('加一个导出按钮', pomo).intent, 'edit');
+  assert.equal(classifyIntent('番茄钟增加长休息设置', pomo).intent, 'edit');
+  const mixed = classifyIntent('把颜色改成蓝色，再做一个记账本应用', pomo);
+  assert.equal(mixed.intent, 'unsure');
+  for (const r of [neu, again, mixed]) assert.ok(r.confidence >= 0 && r.confidence <= 1);
+});
+
+test('applyRuntime: 干净不加罚，错误扣 30，白屏扣 40，重复套用不叠扣', () => {
+  const base = { total: 90, items: [{ name: '结构完整', got: 25, max: 25 }], qa: { ok: true, issues: [] } };
+  const clean = applyRuntime(base, { errors: [], blank: false, textLen: 40, nodes: 8 });
+  assert.equal(clean.total, 90);
+  assert.equal(clean.staticTotal, 90);
+  assert.equal(clean.items.find((i) => i.name === '运行时检查').got, 15);
+  assert.equal(clean.runtime.clean, true);
+  const one = applyRuntime(base, { errors: [{ message: 'x', line: 3 }, { message: 'x' }], blank: false });
+  assert.equal(one.runtime.errorCount, 1);
+  assert.equal(one.items.find((i) => i.name === '运行时检查').got, 7);
+  assert.equal(one.total, 60);
+  const two = applyRuntime(base, { errors: [{ message: 'x' }, { message: 'y' }], blank: false });
+  assert.equal(two.items.find((i) => i.name === '运行时检查').got, 0);
+  assert.equal(two.total, 60);
+  const blank = applyRuntime(base, { errors: [{ message: 'x' }], blank: true, textLen: 0, nodes: 1 });
+  assert.equal(blank.items.find((i) => i.name === '运行时检查').got, 0);
+  assert.equal(blank.total, 50);
+  assert.equal(blank.runtime.blank, true);
+  const again = applyRuntime(one, { errors: [{ message: 'x', line: 3 }] });
+  assert.equal(again.total, one.total);
+  assert.equal(again.items.filter((i) => i.name === '运行时检查').length, 1);
+  const low = applyRuntime({ total: 10, items: [] }, { blank: true });
+  assert.equal(low.total, 0);
+});
+
+test('applyRuntime: 内置模板在干净报告下保持高分', () => {
+  const html = renderTemplate(sources, 'pomodoro', '番茄钟');
+  const base = scoreHtml(html);
+  const next = applyRuntime(base, { errors: [], blank: false, textLen: 80, nodes: 12 });
+  assert.equal(next.runtime.clean, true);
+  assert.equal(next.total, base.total);
+  assert.ok(next.total >= 70);
+});
+
+test('故障演练脚本插在 </body> 前，且静态分按插入前计算', () => {
+  const html = renderTemplate(sources, 'kanban', '看板');
+  const before = scoreHtml(html);
+  const out = injectRuntimeFault(html);
+  assert.ok(out.indexOf("throw new Error") < out.toLowerCase().lastIndexOf('</body>'));
+  assert.match(out, /故障演练：方案 A 运行时错误/);
+  assert.equal(scoreHtml(html).total, before.total);
+});
+
+test('运行时探针脚本只在 probe 模式注入', () => {
+  const plain = buildShim({ storageKey: 'p' });
+  assert.equal(plain.includes('atoms-runtime-report'), false);
+  assert.ok(plain.includes("__atoms:'error'"));
+  const probe = buildShim({ storageKey: 'p', probe: true, probeId: 'ver1' });
+  assert.ok(probe.includes('atoms-runtime-report'));
+  assert.ok(probe.includes('ver1'));
+  assert.equal(probe.includes("__atoms:'error'"), false);
+});
+
 test('设计系统：注入幂等、可剥离还原', () => {
   const h = '<!DOCTYPE html><html><head><title>t</title></head><body></body></html>';
   const a = injectDesignSystem(h);
