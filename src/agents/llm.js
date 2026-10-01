@@ -1,4 +1,4 @@
-// 模型调用层：流式输出 + 超时 + 取消 + 四层防线中的「重试」「备用通道」
+// 模型调用层（Anthropic Messages 兼容接口）：流式输出 + 超时 + 取消 + 四层防线中的「重试」「备用通道」
 // （「节流」在 pipeline 中通过错峰启动实现，「降级模板」在 pipeline 兜底）
 
 export class LlmError extends Error {
@@ -30,28 +30,57 @@ function withTimeout(promise, ms, label) {
     .finally(() => clearTimeout(t));
 }
 
+// ---------- Anthropic Messages API（兼容接口）----------
+// 鉴权与地址只来自 Worker Secret：ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN（不写进代码与仓库）
+function toAnthropic(messages) {
+  const system = messages.filter((m) => m.role === 'system').map((m) => m.content).join('\n\n');
+  const rest = messages.filter((m) => m.role !== 'system').map((m) => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: String(m.content) }));
+  return { system, messages: rest };
+}
+
+async function httpError(res) {
+  let body = '';
+  try { body = (await res.text()).slice(0, 200); } catch {}
+  const st = res.status;
+  if (st === 401 || st === 403) return new LlmError(`模型接口鉴权失败（${st}）`, { kind: 'auth', status: st });
+  if (st === 429) return new LlmError(`上游限流（429）：${body}`, { retryable: true, kind: 'rate_limit', status: 429 });
+  if (st === 402 || /quota|余额|insufficient|credit/i.test(body)) return new LlmError(`模型额度不足（${st}）`, { kind: 'quota', status: st });
+  if (st >= 500) return new LlmError(`上游服务异常（${st}）：${body}`, { retryable: true, status: st });
+  return new LlmError(`模型请求失败（${st}）：${body}`, { status: st });
+}
+
 /**
  * 单次流式调用
  * @returns {Promise<{text:string, truncated:boolean}>}
  */
 export async function streamChat(env, { model, messages, maxTokens = 4096, temperature = 0.4, deadline, onDelta, checkCancel, stopSignal, idleMs = 35_000, firstTokenMs = 45_000 }) {
-  // stopSignal：外部中止（例如赛马已决出胜者），为一个只会 reject 的 Promise
+  // stopSignal：外部中止（用户取消 / 赛马已决出胜者），为一个只会 reject 的 Promise
   const guard = (p, ms, label) => (stopSignal ? Promise.race([withTimeout(p, ms, label), stopSignal]) : withTimeout(p, ms, label));
-  const inputs = { messages, max_tokens: maxTokens, temperature, stream: true };
-  if (/gpt-oss/.test(model)) inputs.reasoning = { effort: 'low' };
   const remain = () => (deadline ? deadline - Date.now() : 120_000);
   if (remain() < 3000) throw new LlmError('时间预算已用尽', { kind: 'timeout' });
-  const stream = await guard(env.AI.run(model, inputs), Math.min(firstTokenMs, remain()), '模型首包超时');
-  if (!stream || typeof stream.getReader !== 'function') {
-    // 部分模型可能不返回流
-    const text = stream?.response ?? stream?.choices?.[0]?.message?.content ?? '';
-    return { text: String(text), truncated: false };
-  }
-  const reader = stream.getReader();
-  const dec = new TextDecoder();
-  let buf = '', text = '', reasoning = 0, truncated = false, lastCancelCheck = Date.now();
+  const base = String(env.ANTHROPIC_BASE_URL || '').replace(/\/+$/, '');
+  const token = env.ANTHROPIC_AUTH_TOKEN;
+  if (!base || !token) throw new LlmError('未配置模型接口（缺少 Secret）', { kind: 'config' });
+
+  const { system, messages: msgs } = toAnthropic(messages);
+  const body = { model, max_tokens: maxTokens, temperature, stream: true, messages: msgs, thinking: { type: 'disabled' } };
+  if (system) body.system = system;
+  const ctrl = new AbortController();
+  let res;
   try {
-    while (true) {
+    res = await guard(fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': token, authorization: `Bearer ${token}`, 'anthropic-version': '2023-06-01', accept: 'text/event-stream' },
+      body: JSON.stringify(body), signal: ctrl.signal,
+    }), Math.min(firstTokenMs, remain()), '模型首包超时');
+  } catch (e) { ctrl.abort(); throw e; }
+  if (!res.ok) throw await httpError(res);
+
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '', text = '', reasoning = 0, truncated = false, lastCancelCheck = Date.now(), ended = false, thinkN = 0;
+  try {
+    while (!ended) {
       const budget = Math.min(idleMs, remain());
       if (budget <= 0) { truncated = true; throw new LlmError('生成超出时间预算，已中断', { kind: 'timeout' }); }
       const { value, done } = await guard(reader.read(), budget, '模型输出停滞，已中断');
@@ -62,16 +91,22 @@ export async function streamChat(env, { model, messages, maxTokens = 4096, tempe
         const line = buf.slice(0, idx).trim();
         buf = buf.slice(idx + 1);
         if (!line.startsWith('data:')) continue;
-        const data = line.slice(5).trim();
-        if (data === '[DONE]') continue;
-        let j; try { j = JSON.parse(data); } catch { continue; }
-        const ch = j.choices?.[0];
-        const delta = ch?.delta?.content ?? (ch ? '' : j.response) ?? '';
-        const r = ch?.delta?.reasoning_content || ch?.delta?.reasoning || '';
-        if (r) reasoning += r.length;
-        if (delta) text += delta;
-        if (ch?.finish_reason === 'length') truncated = true;
-        if ((delta || r) && onDelta) onDelta({ delta, text, reasoning });
+        // 省 CPU：思考增量只计数、不解析
+        if (line.includes('"thinking_delta"')) { reasoning += line.length - 80; if (onDelta && ++thinkN % 60 === 0) onDelta({ delta: '', text, reasoning }); continue; }
+        if (line.includes('"ping"')) continue;
+        let j; try { j = JSON.parse(line.slice(5).trim()); } catch { continue; }
+        if (j.type === 'content_block_delta') {
+          const d = j.delta || {};
+          if (d.type === 'text_delta' && d.text) { text += d.text; onDelta && onDelta({ delta: d.text, text, reasoning }); }
+          else if (d.type === 'thinking_delta') { reasoning += (d.thinking || '').length; onDelta && onDelta({ delta: '', text, reasoning }); }
+        } else if (j.type === 'message_delta') {
+          if (j.delta?.stop_reason === 'max_tokens') truncated = true;
+        } else if (j.type === 'message_stop') {
+          ended = true;
+        } else if (j.type === 'error') {
+          const msg = j.error?.message || JSON.stringify(j.error || j).slice(0, 160);
+          throw classifyError(new Error(`${j.error?.type || 'error'}: ${msg}`));
+        }
       }
       if (checkCancel && Date.now() - lastCancelCheck > 1500) {
         lastCancelCheck = Date.now();
@@ -80,6 +115,7 @@ export async function streamChat(env, { model, messages, maxTokens = 4096, tempe
     }
   } finally {
     try { await reader.cancel(); } catch {}
+    try { ctrl.abort(); } catch {}
   }
   return { text, truncated };
 }
@@ -108,7 +144,7 @@ export async function resilientChat(env, opts, { channels, simulate = 'none', lo
         lastErr = classifyError(e);
         const left = opts.deadline ? opts.deadline - Date.now() : 60_000;
         log({ level: 'warn', text: `${ch.label} 第 ${attempt} 次调用失败：${lastErr.message}` });
-        if (lastErr.kind === 'quota') break; // 额度问题重试无意义，直接换通道
+        if (lastErr.kind === 'quota' || lastErr.kind === 'auth' || lastErr.kind === 'config') break; // 重试无意义，直接换通道 / 降级
         if (!lastErr.retryable || attempt >= ch.attempts) break;
         const backoff = Math.min(4000, 1000 * 2 ** (attempt - 1)) + Math.floor(Math.random() * 400);
         if (left < backoff + 8000) { log({ level: 'warn', text: '剩余时间不足，跳过重试' }); break; }

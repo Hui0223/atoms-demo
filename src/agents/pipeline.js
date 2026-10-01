@@ -1,5 +1,6 @@
 // 多智能体流水线：Planner → Engineer×N（赛马）→ QA/Judge；以及 Editor（增量补丁迭代）
 import { resilientChat, CanceledError, StoppedError } from './llm.js';
+import { channelsFor, laneModelId } from './models.js';
 import { PLANNER_SYSTEM, LANE_VARIANTS, engineerSystem, engineerUser, EDITOR_SYSTEM, editorUser, editorRepair } from './prompts.js';
 import { extractHtml, parseLooseJson } from '../lib/html.js';
 import { injectDesignSystem, stripDesignSystem } from '../lib/designSystem.js';
@@ -13,18 +14,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 export const RACE_GRACE_MS = 50_000; // 赛马：首个方案通过 QA 后，其余方案最多再等 50s（仍受 120s 总预算约束）
 
-function channels(env, swap = false) {
-  const a = { model: env.PRIMARY_MODEL, label: `主模型 ${short(env.PRIMARY_MODEL)}`, attempts: 3 };
-  const b = { model: env.BACKUP_MODEL, label: `备用模型 ${short(env.BACKUP_MODEL)}`, attempts: 2 };
-  // 赛马：A/B 两路使用质量最好的主模型（不同设计取向 + 温度）；第 3 路换用另一模型增加多样性
-  return swap ? [{ ...b, label: `主模型 ${short(b.model)}`, attempts: 2 }, { ...a, label: `备用模型 ${short(a.model)}`, attempts: 2 }] : [a, b];
-}
-// 迭代修改只输出小补丁：优先用响应更快的模型（目标：轻量修改 1 分钟内返回），另一个作备用
-function editChannels(env) {
-  const fast = env.EDIT_MODEL || env.BACKUP_MODEL;
-  const other = fast === env.PRIMARY_MODEL ? env.BACKUP_MODEL : env.PRIMARY_MODEL;
-  return [{ model: fast, label: `主模型 ${short(fast)}`, attempts: 2 }, { model: other, label: `备用模型 ${short(other)}`, attempts: 2 }];
-}
+// 模型选择：用户在前端选 deepseek / glm / mixed（白名单）；主模型失败自动切到另一个，再失败走模板降级
+const mainId = (ctx) => (ctx.modelChoice === 'glm' ? 'glm' : 'deepseek');
 
 // 中止器：把“用户取消”（轮询任务状态）与“赛马提前收敛”统一成一个可 race 的 Promise
 function makeStopper(store, jobId) {
@@ -55,7 +46,7 @@ function fallbackVersion(prompt) {
 export async function runGenerate(ctx, { prompt, lanes = 2 }) {
   const { env, store, jobId, projectId, emit } = ctx;
   const deadline = Date.now() + JOB_BUDGET_MS;
-  const demo = ctx.demo || env.AI_DISABLED === '1';
+  const demo = ctx.demo || env.AI_DISABLED === '1' || !env.ANTHROPIC_AUTH_TOKEN;
   const checkCancel = () => store.isCanceled(jobId);
   const say = async (agent, content, meta) => { const id = await store.addMessage(projectId, 'agent', agent, content, meta); emit('message', { id, role: 'agent', agent, content, meta, created_at: Date.now() }); };
   const log = (agent) => (l) => emit('log', { agent, ...l });
@@ -66,8 +57,8 @@ export async function runGenerate(ctx, { prompt, lanes = 2 }) {
   let planMode = 'heuristic';
   if (!demo) {
     try {
-      const r = await resilientChat(env, { messages: [{ role: 'system', content: PLANNER_SYSTEM }, { role: 'user', content: prompt }], maxTokens: 600, temperature: 0.2, deadline: Math.min(deadline, Date.now() + 25_000), checkCancel },
-        { channels: [{ model: env.PLANNER_MODEL, label: `规划模型 ${short(env.PLANNER_MODEL)}`, attempts: 2 }], simulate: ctx.simulate, log: log('planner') });
+      const r = await resilientChat(env, { messages: [{ role: 'system', content: PLANNER_SYSTEM }, { role: 'user', content: prompt }], maxTokens: 2500, temperature: 0.2, deadline: Math.min(deadline, Date.now() + 25_000), checkCancel },
+        { channels: channelsFor(env, mainId(ctx), { attempts: 2, backupAttempts: 1 }), simulate: ctx.simulate, log: log('planner') });
       const j = parseLooseJson(r.text);
       if (j && Array.isArray(j.features) && j.features.length) { plan = { ...plan, ...j, features: j.features.slice(0, 6).map(String) }; planMode = 'ai'; }
     } catch (e) {
@@ -97,17 +88,18 @@ export async function runGenerate(ctx, { prompt, lanes = 2 }) {
     await sleep(i * 1500); // 节流：错峰启动，降低撞 429 概率
     const t0 = Date.now();
     let lastEmit = 0;
-    emit('lane', { lane: v.id, name: v.name, status: 'running', chars: 0 });
+    const laneChannels = channelsFor(env, laneModelId(ctx.modelChoice || 'deepseek', i));
+    emit('lane', { lane: v.id, name: v.name, status: 'running', chars: 0, model: short(laneChannels[0].model) });
     try {
       const r = await resilientChat(env, {
         messages: [{ role: 'system', content: engineerSystem(v.desc) }, { role: 'user', content: engineerUser(prompt, plan) }],
-        maxTokens: 9000, temperature: v.temperature, deadline, stopSignal: stoppers[i].signal, isStopped: stoppers[i].isStopped,
+        maxTokens: 12000, temperature: v.temperature, deadline, stopSignal: stoppers[i].signal, isStopped: stoppers[i].isStopped,
         onDelta: ({ text, reasoning }) => {
           if (Date.now() - lastEmit < 350) return;
           lastEmit = Date.now();
           emit('lane', { lane: v.id, status: text ? 'coding' : 'thinking', chars: text.length, reasoning, tail: text.slice(-240) });
         },
-      }, { channels: channels(env, i === 2), simulate: ctx.simulate, log: (l) => emit('log', { agent: 'engineer', lane: v.id, ...l }) });
+      }, { channels: laneChannels, simulate: ctx.simulate, log: (l) => emit('log', { agent: 'engineer', lane: v.id, ...l }) });
       const raw = extractHtml(r.text);
       const score = scoreHtml(raw, plan.features); // 在注入设计系统前打分，避免基础样式“刷分”
       const html = injectDesignSystem(raw);
@@ -156,7 +148,7 @@ export async function runGenerate(ctx, { prompt, lanes = 2 }) {
 export async function runEdit(ctx, { request, baseVersionId }) {
   const { env, store, jobId, projectId, emit } = ctx;
   const deadline = Date.now() + JOB_BUDGET_MS;
-  const demo = ctx.demo || env.AI_DISABLED === '1';
+  const demo = ctx.demo || env.AI_DISABLED === '1' || !env.ANTHROPIC_AUTH_TOKEN;
   const checkCancel = () => store.isCanceled(jobId);
   const say = async (agent, content, meta) => { const id = await store.addMessage(projectId, 'agent', agent, content, meta); emit('message', { id, role: 'agent', agent, content, meta, created_at: Date.now() }); };
 
@@ -188,9 +180,9 @@ export async function runEdit(ctx, { request, baseVersionId }) {
   emit('stage', { stage: 'edit', text: '编辑智能体正在生成增量补丁…' });
   let lastEmit = 0;
   const stopper = makeStopper(store, jobId);
-  const chs = editChannels(env);
+  const chs = channelsFor(env, mainId(ctx), { attempts: 2, backupAttempts: 2 });
   const call = (messages, list) => resilientChat(env, {
-    messages, maxTokens: 4000, temperature: 0.2, deadline, stopSignal: stopper.signal, isStopped: stopper.isStopped,
+    messages, maxTokens: 6000, temperature: 0.2, deadline, stopSignal: stopper.signal, isStopped: stopper.isStopped,
     onDelta: ({ text, reasoning }) => { if (Date.now() - lastEmit > 350) { lastEmit = Date.now(); emit('lane', { lane: 'E', status: text ? 'coding' : 'thinking', chars: text.length, reasoning, tail: text.slice(-240) }); } },
   }, { channels: list, simulate: ctx.simulate, log: (l) => emit('log', { agent: 'editor', ...l }) });
 

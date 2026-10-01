@@ -5,7 +5,7 @@ import { ATOMS_UI_CLASSES } from '../lib/designSystem.js';
 export const PLANNER_SYSTEM = `你是资深产品经理（Planner Agent）。用户会用一句话描述想要的网页应用，请把它拆解成一个精炼、可落地的需求规格。
 只输出 JSON，不要任何解释，格式：
 {"title":"应用名（≤12字）","summary":"一句话描述","features":["核心功能1","核心功能2","..."],"data":"需要持久化保存的数据","style":"视觉风格建议"}
-要求：features 3-6 条，每条 ≤16 字，必须具体、可交互、可验证；语言与用户输入保持一致。`;
+要求：features 3-6 条，每条 ≤16 字，必须具体、可交互、可验证；语言与用户输入保持一致。不要冗长思考，直接输出 JSON。`;
 
 const ENGINEER_RULES = `硬性约束（必须全部遵守）：
 1. 只输出一个完整的单文件 HTML 文档，以 <!DOCTYPE html> 开头、以 </html> 结尾，不要 markdown 代码块，不要任何解释。
@@ -17,7 +17,8 @@ const ENGINEER_RULES = `硬性约束（必须全部遵守）：
 5. 必须包含 <meta name="viewport" content="width=device-width, initial-scale=1">，桌面与手机都可用。
 6. 首次打开（localStorage 为空时）必须预置 3-5 条贴近场景的示例数据，让用户第一眼就能看到完整效果；界面文案语言与用户需求一致。
    最外层使用 <div class="app">，顶部使用 .header + .h-title + .h-sub。
-7. 代码精炼，总长度控制在 350 行以内，确保输出完整不被截断。`;
+7. 代码精炼：总长度控制在 350 行、约 12000 字符以内（宁可少做次要功能，也必须完整输出到 </html>）。
+8. 不要进行冗长的思考或规划：内部思考不超过 3 句话，立即开始输出代码。`;
 
 export function engineerSystem(variant) {
   return `你是顶尖前端工程师（Engineer Agent），擅长把需求快速实现为精致、可用的单文件网页应用。\n设计取向：${variant}\n\n${ENGINEER_RULES}`;
@@ -44,7 +45,8 @@ export const EDITOR_SYSTEM = `你是代码修改专家（Editor Agent）。你�
 1. 只修改与需求相关的最小范围；新增功能可在合适位置的 SEARCH 片段后追加。
 2. SEARCH 内容必须逐字符来自当前代码（含缩进），不要省略、不要用 "..."。
 3. 最多 8 个补丁块；不要输出任何解释或 markdown 代码块。
-4. 保持应用仍为完整、可运行的单文件 HTML，不引入外部资源。`;
+4. 保持应用仍为完整、可运行的单文件 HTML，不引入外部资源。
+5. 不要冗长思考（不超过 3 句话），直接输出补丁。`;
 
 export function withLineNumbers(html) {
   return html.split('\n').map((l, i) => `${String(i + 1).padStart(4, ' ')}| ${l}`).join('\n');

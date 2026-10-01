@@ -3,6 +3,7 @@ import { DurableObject } from 'cloudflare:workers';
 import sources from './templates/sources.js';
 import { renderTemplate } from './templates/engine.js';
 import { scoreHtml } from './lib/qa.js';
+import { startRun } from './runner.js';
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, pass_hash TEXT, salt TEXT, is_guest INTEGER DEFAULT 0, ip TEXT, created_at INTEGER);
@@ -39,6 +40,16 @@ export class AppStore extends DurableObject {
       for (const stmt of SCHEMA.split(';').map((s) => s.trim()).filter(Boolean)) this.sql.exec(stmt);
       this.seed();
     });
+  }
+
+  // HTTP 入口：仅用于流式任务（Worker 转发）
+  async fetch(request) {
+    const url = new URL(request.url);
+    if (request.method === 'POST' && url.pathname === '/run') {
+      const payload = await request.json();
+      return startRun(this.env, this, payload);
+    }
+    return new Response('not found', { status: 404 });
   }
 
   q(sql, ...args) { return this.sql.exec(sql, ...args).toArray(); }

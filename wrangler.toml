@@ -9,9 +9,6 @@ binding = "ASSETS"
 not_found_handling = "single-page-application"
 run_worker_first = ["/api/*", "/s/*"]
 
-[ai]
-binding = "AI"
-
 [[durable_objects.bindings]]
 name = "STORE"
 class_name = "AppStore"
@@ -21,12 +18,14 @@ tag = "v1"
 new_sqlite_classes = ["AppStore"]
 
 [vars]
-PRIMARY_MODEL = "@cf/openai/gpt-oss-120b"
-BACKUP_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
-PLANNER_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
-EDIT_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+# 模型白名单（Anthropic Messages 兼容接口上的确切模型名）
+MODEL_DEEPSEEK = "deepseek-v4-flash"
+MODEL_GLM = "glm-5.3-flash"
 # 设为 "1" 可强制全站进入演示模式（不调用任何模型）
 AI_DISABLED = "0"
+# 接口地址与密钥只通过 Secret 注入（不写在这里）：
+#   npx wrangler secret put ANTHROPIC_BASE_URL
+#   npx wrangler secret put ANTHROPIC_AUTH_TOKEN
 
 [[rules]]
 type = "Text"

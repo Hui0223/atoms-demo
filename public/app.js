@@ -161,8 +161,11 @@ function route() {
 }
 
 // ---------------- 首页 ----------------
+const MODEL_LABEL = { deepseek: 'DeepSeek V4 Flash', glm: 'GLM-5.3 Flash', mixed: '混合（各路交替）' };
 function composerOptions(prefix = '') {
-  return `<label class="opt" title="赛马模式：多路工程师智能体并行生成，自动打分择优">🏁 赛马
+  return `<label class="opt" title="生成所用模型；主模型失败时自动切换到另一个，再失败则用内置模板兜底">🧠 模型
+      <select id="${prefix}model"><option value="deepseek" selected>DeepSeek V4 Flash</option><option value="glm">GLM-5.3 Flash（推理较慢）</option><option value="mixed">混合（赛马各路交替）</option></select></label>
+    <label class="opt" title="赛马模式：多路工程师智能体并行生成，自动打分择优">🏁 赛马
       <select id="${prefix}lanes"><option value="1">1 路</option><option value="2" selected>2 路</option><option value="3">3 路</option></select></label>
     <label class="opt" title="不调用模型，使用内置模板与规则引擎（额度为零时也能完整演示）"><input type="checkbox" id="${prefix}demo"> 演示模式</label>
     <label class="opt" title="故障演练：验证重试 / 备用模型 / 降级兜底链路">🧯 故障演练
@@ -197,7 +200,7 @@ function viewHome(app) {
     try {
       if (!(await ensureLogin('作品将保存在该账号下'))) return;
       const { id } = await api('/api/projects', { method: 'POST', body: { prompt } });
-      sessionStorage.setItem('atoms_autostart', JSON.stringify({ id, prompt, lanes: +$('#lanes').value, demo: $('#demo').checked, simulate: $('#simulate').value }));
+      sessionStorage.setItem('atoms_autostart', JSON.stringify({ id, prompt, lanes: +$('#lanes').value, model: $('#model').value, demo: $('#demo').checked, simulate: $('#simulate').value }));
       location.hash = '#/p/' + id;
     } catch (e) { toast(e.message); } finally { $('#go').disabled = false; }
   };
@@ -304,7 +307,8 @@ async function viewProject(app, id) {
     const el = document.createElement('div');
     if (m.role === 'user') {
       el.className = 'msg user';
-      const opts = m.meta && m.meta.type === 'generate' ? `<div class="small" style="opacity:.8;margin-top:4px">${m.meta.demo ? '演示模式' : `赛马 ${m.meta.lanes || 1} 路`}${m.meta.simulate && m.meta.simulate !== 'none' ? ' · 故障演练' : ''}</div>` : '';
+      const mm = m.meta || {};
+      const opts = mm.type ? `<div class="small" style="opacity:.8;margin-top:4px">${mm.demo ? '演示模式' : `${mm.type === 'generate' ? `赛马 ${mm.lanes || 1} 路 · ` : ''}${MODEL_LABEL[mm.model] || MODEL_LABEL.deepseek}`}${mm.simulate && mm.simulate !== 'none' ? ' · 故障演练' : ''}</div>` : '';
       el.innerHTML = `<div class="who">🙂</div><div class="bubble">${md(m.content)}${opts}</div>`;
       return el;
     }
@@ -354,7 +358,7 @@ async function viewProject(app, id) {
     const ask = $('#ask');
     $$('.quick .chip', c).forEach((ch) => (ch.onclick = () => { ask.value = ch.textContent; ask.focus(); }));
     ask.addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) $('#send').click(); });
-    const opts = () => ({ lanes: +$('#wlanes').value, demo: $('#wdemo').checked, simulate: $('#wsimulate').value });
+    const opts = () => ({ lanes: +$('#wlanes').value, model: $('#wmodel').value, demo: $('#wdemo').checked, simulate: $('#wsimulate').value });
     $('#send').onclick = () => {
       const text = ask.value.trim();
       if (!text) { if (!hasVersion) startRun({ type: 'generate', prompt: st.data.project.prompt, ...opts() }); else ask.focus(); return; }
@@ -531,7 +535,7 @@ async function viewProject(app, id) {
   const auto = JSON.parse(sessionStorage.getItem('atoms_autostart') || 'null');
   if (auto && auto.id === id && owner) {
     sessionStorage.removeItem('atoms_autostart');
-    if (!data.project.currentVersionId && !data.activeJob) startRun({ type: 'generate', prompt: auto.prompt, lanes: auto.lanes, demo: auto.demo, simulate: auto.simulate });
+    if (!data.project.currentVersionId && !data.activeJob) startRun({ type: 'generate', prompt: auto.prompt, lanes: auto.lanes, model: auto.model, demo: auto.demo, simulate: auto.simulate });
   } else if (data.activeJob && owner) resumeJob(data.activeJob);
 }
 

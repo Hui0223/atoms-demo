@@ -1,8 +1,7 @@
 // Atoms Demo —— Cloudflare Worker 入口：静态资源 + REST/流式 API + 分享页
 import { AppStore } from './store.js';
 import { hashPassword, verifyPassword, newToken, validateCredentials } from './lib/auth.js';
-import { runGenerate, runEdit, short } from './agents/pipeline.js';
-import { CanceledError } from './agents/llm.js';
+import { catalog } from './agents/models.js';
 import { injectShim } from '../public/shim.js';
 import { escapeHtml } from './lib/html.js';
 
@@ -31,7 +30,7 @@ async function issueSession(env, user) {
 const routes = [];
 const route = (method, pattern, handler, opts = {}) => routes.push({ method, re: new RegExp('^' + pattern.replace(/:(\w+)/g, '(?<$1>[^/]+)') + '$'), handler, ...opts });
 
-route('GET', '/api/health', async (req, env) => json({ ok: true, aiDisabled: env.AI_DISABLED === '1', models: { primary: short(env.PRIMARY_MODEL), backup: short(env.BACKUP_MODEL), planner: short(env.PLANNER_MODEL) } }));
+route('GET', '/api/health', async (req, env) => json({ ok: true, aiDisabled: env.AI_DISABLED === '1', llmConfigured: !!(env.ANTHROPIC_BASE_URL && env.ANTHROPIC_AUTH_TOKEN), models: catalog(env).map(({ id, model, label }) => ({ id, model, label })) }));
 
 route('POST', '/api/auth/register', async (req, env, { user }) => {
   const { username, password } = await readJson(req);
@@ -153,8 +152,9 @@ route('POST', '/api/jobs/:id/cancel', async (req, env, { user, params }) => {
   return json({ ok: true });
 }, { auth: true });
 
-// 核心：发起生成 / 迭代，返回 SSE 流；任务本身通过 waitUntil 在后台跑完并落库（刷新可恢复）
-route('POST', '/api/projects/:id/run', async (req, env, { user, params, ctx }) => {
+// 核心：发起生成 / 迭代，返回 SSE 流。
+// 任务在 Durable Object 内执行（DO 的单请求 CPU 预算远高于免费版 Worker 的 10ms），Worker 只做鉴权与转发。
+route('POST', '/api/projects/:id/run', async (req, env, { user, params }) => {
   const r = await loadOwned(env, user, params.id);
   if (r.error) return r.error;
   const body = await readJson(req);
@@ -163,54 +163,7 @@ route('POST', '/api/projects/:id/run', async (req, env, { user, params, ctx }) =
   if (!text) return err('请输入内容');
   if (text.length > 2000) return err('输入请控制在 2000 字以内');
   if (type === 'edit' && !r.row.current_version_id) return err('当前项目还没有可修改的版本');
-  const store = db(env);
-  const jr = await store.createJob(params.id, user.id, type);
-  if (jr.error) return err(jr.error, 429);
-  const jobId = jr.job.id;
-  const umid = await store.addMessage(params.id, 'user', null, text, { type, lanes: body.lanes, demo: !!body.demo, simulate: body.simulate || 'none' });
-
-  const { readable, writable } = new TransformStream();
-  const writer = writable.getWriter();
-  const enc = new TextEncoder();
-  let open = true;
-  const emit = (event, data) => {
-    if (!open) return;
-    writer.write(enc.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)).catch(() => { open = false; });
-  };
-  const simulate = ['primary429', 'alldown'].includes(body.simulate) ? body.simulate : 'none';
-  const jctx = { env, store, jobId, projectId: params.id, emit, simulate, demo: !!body.demo };
-  const startedAt = Date.now();
-  const heartbeat = setInterval(() => emit('ping', { elapsed: Date.now() - startedAt }), 5000);
-
-  const task = (async () => {
-    emit('job', { id: jobId, type, userMessageId: umid });
-    let result;
-    try {
-      result = type === 'edit' ? await runEdit(jctx, { request: text, baseVersionId: body.baseVersionId || r.row.current_version_id }) : await runGenerate(jctx, { prompt: text, lanes: body.lanes ?? 2 });
-      await store.updateJob(jobId, result.status === 'done' ? 'done' : result.status, { result });
-    } catch (e) {
-      // 异常绝不穿透：取消 / 未知错误都转成可展示的状态
-      if (e instanceof CanceledError) {
-        result = { status: 'canceled' };
-        await store.updateJob(jobId, 'canceled', { result });
-        const mid = await store.addMessage(params.id, 'agent', 'system', '⏹ 已取消本次任务，已有版本保持不变。');
-        emit('message', { id: mid, role: 'agent', agent: 'system', content: '⏹ 已取消本次任务，已有版本保持不变。' });
-      } else {
-        console.error('job failed', e?.stack || e);
-        result = { status: 'failed', error: String(e?.message || e) };
-        await store.updateJob(jobId, 'failed', { result });
-        const mid = await store.addMessage(params.id, 'agent', 'system', `任务异常：${result.error}。已有版本不受影响，可重试。`);
-        emit('message', { id: mid, role: 'agent', agent: 'system', content: `任务异常：${result.error}` });
-      }
-    } finally {
-      clearInterval(heartbeat);
-      emit('done', { ...result, elapsed: Date.now() - startedAt });
-      open = false;
-      try { await writer.close(); } catch {}
-    }
-  })();
-  ctx.waitUntil(task);
-  return new Response(readable, { headers: { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-store', 'x-accel-buffering': 'no' } });
+  return db(env).fetch('https://store/run', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ projectId: params.id, userId: user.id, body: { ...body, type, prompt: text } }) });
 }, { auth: true });
 
 // 分享页：独立页面运行生成的应用（CSP sandbox 隔离，无法访问本站登录态）
