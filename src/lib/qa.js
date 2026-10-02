@@ -93,6 +93,43 @@ export function scoreHtml(html, features = []) {
 
 function clamp(n, lo, hi) { return Math.max(lo, Math.min(hi, n)); }
 
+function isIntIn(n, lo, hi) {
+  return typeof n === 'number' && Number.isInteger(n) && n >= lo && n <= hi;
+}
+
+/**
+ * 校验客户端运行时报告。不改写、不截断：任一字段越界即失败，由接口返回 400。
+ * versionIds 给出时，每条 versionId 必须属于该任务。
+ */
+export function validateRuntimeReports(reports, { versionIds } = {}) {
+  if (!Array.isArray(reports)) return { ok: false, error: '报告格式不正确' };
+  if (reports.length > 8) return { ok: false, error: '报告数量过多' };
+  const allowed = versionIds ? new Set([...versionIds].map((id) => String(id))) : null;
+  const out = [];
+  for (const r of reports) {
+    if (!r || typeof r !== 'object' || Array.isArray(r)) return { ok: false, error: '报告格式不正确' };
+    const versionId = typeof r.versionId === 'string' ? r.versionId : (typeof r.versionId === 'number' ? String(r.versionId) : '');
+    if (!versionId || versionId.length > 64) return { ok: false, error: '版本编号不合法' };
+    if (allowed && !allowed.has(versionId)) return { ok: false, error: '版本不属于该任务' };
+    if (typeof r.blank !== 'boolean') return { ok: false, error: 'blank 必须是布尔值' };
+    if (!Array.isArray(r.errors)) return { ok: false, error: 'errors 必须是数组' };
+    if (r.errors.length > 12) return { ok: false, error: '错误条数过多' };
+    const errors = [];
+    for (const e of r.errors) {
+      if (!e || typeof e !== 'object' || Array.isArray(e)) return { ok: false, error: '错误项格式不正确' };
+      if (typeof e.message !== 'string') return { ok: false, error: '错误信息必须是字符串' };
+      if (e.message.length > 300) return { ok: false, error: '错误信息过长' };
+      if (!isIntIn(e.line, 0, 1e6)) return { ok: false, error: '行号不合法' };
+      const message = e.message.trim();
+      if (message) errors.push({ message, line: e.line });
+    }
+    if (!isIntIn(r.textLen, 0, 1e7)) return { ok: false, error: 'textLen 不合法' };
+    if (!isIntIn(r.nodes, 0, 1e7)) return { ok: false, error: 'nodes 不合法' };
+    out.push({ versionId, errors, blank: r.blank, textLen: r.textLen, nodes: r.nodes });
+  }
+  return { ok: true, reports: out };
+}
+
 // 按 message 去重，保留首次出现的行号
 function distinctErrors(errors) {
   const out = [];

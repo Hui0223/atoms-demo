@@ -46,6 +46,11 @@ function shortModel(name) {
   return s || full;
 }
 
+function jobErrorText(j) {
+  const d = (j && j.detail) || {};
+  return d.error || (d.result && d.result.error) || '';
+}
+
 function toast(msg, ms = 2600) {
   const t = $('#toast'); t.textContent = msg; t.hidden = false;
   clearTimeout(toast._t); toast._t = setTimeout(() => (t.hidden = true), ms);
@@ -108,7 +113,7 @@ function renderUser() {
   const u = auth.user;
   const box = $('#userbox');
   if (!u || !auth.token) { box.innerHTML = `<button class="btn sm" id="loginBtn">登录 / 注册</button>`; $('#loginBtn').onclick = () => openAuth('login'); return; }
-  box.innerHTML = `<span class="avatar">${esc(u.username.slice(0, 1))}</span><span>${esc(u.username)}</span>${u.isGuest ? '<button class="btn sm primary" id="upBtn">升级为正式账号</button>' : ''}<button class="btn sm ghost" id="logoutBtn">退出</button>`;
+  box.innerHTML = `<span class="avatar">${esc(u.username.slice(0, 1))}</span><span class="uname">${esc(u.username)}</span>${u.isGuest ? '<button class="btn sm primary" id="upBtn"><span class="up-full">升级为正式账号</span><span class="up-short">升级</span></button>' : ''}<button class="btn sm ghost" id="logoutBtn">退出</button>`;
   if (u.isGuest) $('#upBtn').onclick = () => openAuth('register');
   $('#logoutBtn').onclick = async () => { if (u.isGuest && !confirm('游客账号退出后将无法再找回其项目，建议先“升级为正式账号”。确定退出？')) return; await api('/api/auth/logout', { method: 'POST' }).catch(() => {}); auth.clear(); renderUser(); location.hash = '#/'; };
 }
@@ -271,6 +276,7 @@ function probeHtml(html, versionId) {
       });
     };
     const onMsg = (e) => {
+      if (e.source !== f.contentWindow) return;
       const d = e.data;
       if (!d || typeof d !== 'object') return;
       if (d.type !== 'atoms-runtime-report' && d.__atoms !== 'runtime-report') return;
@@ -667,8 +673,9 @@ async function viewProject(app, id) {
     paintLanes(); paintStepper();
     if (progress.stage && progress.stage !== prevStage) pinToProgress();
   }
-  async function performRuntimeCheck(jobId) {
+  async function performRuntimeCheck(jobId, token) {
     if (!jobId || st.checkingThis === jobId) return false;
+    if (!token) { st.checkingThis = null; return false; }
     st.checkingThis = jobId;
     try {
       const d = await api('/api/projects/' + id);
@@ -681,23 +688,43 @@ async function viewProject(app, id) {
         return { versionId: v.id, ...rep };
       }));
       if (!alive) return false;
-      const real = reports.filter((rep) => !rep.timeout);
+      const real = reports.filter((rep) => !rep.timeout).map((rep) => ({
+        versionId: rep.versionId,
+        blank: !!rep.blank,
+        textLen: Math.max(0, Math.min(1e7, rep.textLen | 0)),
+        nodes: Math.max(0, Math.min(1e7, rep.nodes | 0)),
+        errors: (Array.isArray(rep.errors) ? rep.errors : []).slice(0, 12).map((e) => ({
+          message: String((e && e.message) || '').slice(0, 300),
+          line: Math.max(0, Math.min(1e6, (e && e.line) | 0)),
+        })),
+      }));
       if (!real.length) { st.checkingThis = null; return false; }
-      await api(`/api/projects/${id}/runtime-check`, { method: 'POST', body: { jobId, reports: real } });
+      await api(`/api/projects/${id}/runtime-check`, { method: 'POST', body: { jobId, reports: real, runtimeToken: token } });
+      if (!alive) return true;
+      const fresh = await api('/api/projects/' + id);
+      st.data.messages = fresh.messages;
+      st.data.versions = fresh.versions;
+      st.data.project = fresh.project;
+      if (fresh.project.currentVersionId) {
+        st.viewVersionId = fresh.project.currentVersionId;
+        st.html = fresh.html || st.html;
+      }
+      renderMessages();
+      renderStage();
       return true;
     } catch (e) {
       st.checkingThis = null;
       throw e;
     }
   }
-  async function enterRuntime(r, jobId) {
+  async function enterRuntime(r, jobId, token) {
     r.stageId = 'runtime'; r.stageAt = Date.now();
     const stage = $('.stage', r.el); if (stage) stage.textContent = '正在隐藏沙箱里做运行时检查…';
     paintStepper();
     pinToProgress();
     st.checkingRuntime = true;
     let checked = false;
-    try { checked = await performRuntimeCheck(jobId); } catch (e) { console.error(e); }
+    try { checked = await performRuntimeCheck(jobId, token || (r.done && r.done.runtimeToken)); } catch (e) { console.error(e); }
     st.checkingRuntime = false;
     if (st.running === r) { r.stageId = 'done'; r.stageAt = Date.now(); paintStepper(); pinToProgress(); }
     return checked;
@@ -723,18 +750,41 @@ async function viewProject(app, id) {
       if (s > 160) ctrl.abort(); // 前端兜底：服务端预算 120s，超过 160s 视为连接异常
     }, 500);
     let checked = false;
+    let streamErr = null;
     try {
       await streamRun(`/api/projects/${id}/run`, { ...body, baseVersionId: st.data.project.currentVersionId }, onEvent, ctrl.signal);
     } catch (e) {
-      if (e.name !== 'AbortError') toast(e.message);
+      streamErr = e;
     } finally {
       clearInterval(r.tick);
       const done = r.done;
       const jobId = r.jobId;
-      if (alive && done && done.status === 'done' && jobId && st.running) checked = await enterRuntime(r, jobId);
+      if (alive && done && done.status === 'done' && jobId && st.running) checked = await enterRuntime(r, jobId, done.runtimeToken);
       const demoMode = done && done.status === 'done' && done.mode === 'demo';
+      const interrupted = !done;
+      if (!alive) { st.running = null; return; }
+      if (interrupted && jobId) {
+        try {
+          const { job: j } = await api('/api/jobs/' + jobId);
+          if (j && (j.status === 'running' || j.status === 'canceling')) {
+            st.running = null;
+            await resumeJob(j);
+            return;
+          }
+          const detailErr = jobErrorText(j);
+          st.running = null;
+          renderComposer();
+          let msg = detailErr || (streamErr && streamErr.name !== 'AbortError' ? streamErr.message : '连接已结束，本次生成未完成，可直接重新生成');
+          if (j && j.status === 'canceled' && !detailErr) msg = '已取消本次任务，已有版本保持不变。';
+          toast(msg, 5600);
+          await refresh(null);
+          return;
+        } catch {}
+      }
       st.running = null;
-      if (!alive) return;
+      renderComposer();
+      if (interrupted) toast(streamErr && streamErr.name !== 'AbortError' ? streamErr.message : '连接已结束，本次生成未完成，可直接重新生成', 5600);
+      else if (streamErr && streamErr.name !== 'AbortError') toast(streamErr.message);
       await refresh(checked ? null : (done && done.versionId ? done.versionId : null));
       if (demoMode) toast('模型不可用或已开启演示模式：已使用内置模板 / 规则引擎完成');
     }
@@ -774,8 +824,12 @@ async function viewProject(app, id) {
         if (j.detail && j.detail.progress) applySnapshot(r, j.detail.progress);
         if (j.status !== 'running' && j.status !== 'canceling') {
           clearInterval(r.tick);
-          if (j.status === 'done') await enterRuntime(r, job.id);
+          if (j.status === 'done') await enterRuntime(r, job.id, j.detail && j.detail.runtimeToken);
           st.running = null;
+          if (alive) renderComposer();
+          if (j.status === 'failed' || j.status === 'canceled') {
+            toast(jobErrorText(j) || (j.status === 'canceled' ? '已取消本次任务，已有版本保持不变。' : '任务未完成，可直接重新生成'), 5600);
+          }
           if (alive) await refresh();
         }
       } catch { clearInterval(r.tick); st.running = null; if (alive) await refresh(); }
@@ -858,6 +912,15 @@ async function viewProject(app, id) {
   };
   $('#share').onclick = async () => {
     if (!st.data.project.currentVersionId) return toast('还没有可分享的版本');
+    if (owner && !st.data.project.isPublic) {
+      if (!confirm('分享前需要先公开作品，是否公开并复制链接？')) return;
+      try {
+        await api('/api/projects/' + id, { method: 'PATCH', body: { isPublic: true } });
+        st.data.project.isPublic = true;
+        const pub = $('#pub');
+        if (pub) pub.checked = true;
+      } catch (e) { toast(e.message); return; }
+    }
     const url = `${location.origin}/s/${id}`;
     try { await navigator.clipboard.writeText(url); toast('分享链接已复制：' + url, 4000); } catch { prompt('复制分享链接', url); }
   };
@@ -884,7 +947,7 @@ async function viewProject(app, id) {
     renderMessages(); renderComposer();
     const stage = $('.stage', r.el); if (stage) stage.textContent = '正在补做运行时检查…';
     paintStepper();
-    enterRuntime(r, pr.id).catch((e) => console.error(e)).finally(async () => {
+    enterRuntime(r, pr.id, pr.token).catch((e) => console.error(e)).finally(async () => {
       st.running = null;
       if (alive) await refresh();
     });

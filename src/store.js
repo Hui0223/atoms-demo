@@ -2,7 +2,8 @@
 import { DurableObject } from 'cloudflare:workers';
 import sources from './templates/sources.js';
 import { renderTemplate } from './templates/engine.js';
-import { scoreHtml, applyRuntime } from './lib/qa.js';
+import { scoreHtml, applyRuntime, validateRuntimeReports } from './lib/qa.js';
+import { timingSafeEqualStr } from './lib/auth.js';
 import { LANE_VARIANTS } from './agents/prompts.js';
 import { startRun } from './runner.js';
 
@@ -19,6 +20,9 @@ CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY, project_id TEXT NOT NUL
 CREATE INDEX IF NOT EXISTS idx_messages_project ON messages(project_id, created_at);
 CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, project_id TEXT, user_id TEXT, type TEXT, status TEXT, detail TEXT, created_at INTEGER, updated_at INTEGER);
 CREATE INDEX IF NOT EXISTS idx_jobs_project ON jobs(project_id, created_at);
+CREATE TABLE IF NOT EXISTS auth_fail(key TEXT PRIMARY KEY, count INTEGER NOT NULL, first_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS usage(user_id TEXT NOT NULL, kind TEXT NOT NULL, created_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_usage_user ON usage(user_id, created_at);
 `;
 
 const PRESETS = [
@@ -32,6 +36,11 @@ const PRESETS = [
 const uid = () => crypto.randomUUID().replace(/-/g, '').slice(0, 16);
 const now = () => Date.now();
 const STALE_MS = 150_000;
+const HOUR_MS = 3600_000;
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const ORPHAN_MSG = '任务中断：服务重启（如刚部署新版本），本次生成未完成，已有版本不受影响，可直接重新生成';
+const MODEL_QUOTA = 30;
+const RULES_INTENT_QUOTA = 120;
 
 export class AppStore extends DurableObject {
   constructor(ctx, env) {
@@ -40,6 +49,8 @@ export class AppStore extends DurableObject {
     ctx.blockConcurrencyWhile(async () => {
       for (const stmt of SCHEMA.split(';').map((s) => s.trim()).filter(Boolean)) this.sql.exec(stmt);
       this.seed();
+      // 任务在本 DO 内执行。进程起来时仍是 running/canceling 的行，一定是重启前被打断的，不会再有人接着跑。
+      this.failOrphanJobs();
     });
   }
 
@@ -55,6 +66,14 @@ export class AppStore extends DurableObject {
 
   q(sql, ...args) { return this.sql.exec(sql, ...args).toArray(); }
   one(sql, ...args) { return this.q(sql, ...args)[0] || null; }
+
+  failOrphanJobs() {
+    const rows = this.q("SELECT id, project_id FROM jobs WHERE status IN ('running','canceling')");
+    for (const r of rows) {
+      this.updateJob(r.id, 'failed', { error: ORPHAN_MSG, result: { status: 'failed', error: ORPHAN_MSG } });
+      if (r.project_id) this.addMessage(r.project_id, 'agent', 'system', ORPHAN_MSG);
+    }
+  }
 
   seed() {
     if (this.one("SELECT id FROM users WHERE id='system'")) return;
@@ -97,6 +116,45 @@ export class AppStore extends DurableObject {
     return r ? { id: r.id, username: r.username, isGuest: !!r.is_guest } : null;
   }
   deleteSession(token) { this.sql.exec('DELETE FROM sessions WHERE token=?', token); }
+  updatePassword(userId, passHash, salt) {
+    this.sql.exec('UPDATE users SET pass_hash=?, salt=? WHERE id=?', passHash, salt, userId);
+  }
+
+  // ---------- 登录失败计数（用户名 / IP，15 分钟窗口）----------
+  authFailState(key) {
+    const row = this.one('SELECT count, first_at FROM auth_fail WHERE key=?', key);
+    if (!row) return { count: 0, firstAt: 0 };
+    if (now() - row.first_at >= LOGIN_WINDOW_MS) return { count: 0, firstAt: 0 };
+    return { count: row.count | 0, firstAt: row.first_at };
+  }
+  recordAuthFail(key) {
+    const cur = this.authFailState(key);
+    const count = cur.count + 1;
+    const firstAt = cur.count ? cur.firstAt : now();
+    this.sql.exec('INSERT INTO auth_fail(key,count,first_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET count=excluded.count, first_at=excluded.first_at', key, count, firstAt);
+    return { count, firstAt };
+  }
+  clearAuthFail(key) { this.sql.exec('DELETE FROM auth_fail WHERE key=?', key); }
+
+  // ---------- 模型额度：生成任务 + 真正打到模型的意图判断 ----------
+  hourlyModelUses(userId) {
+    const since = now() - HOUR_MS;
+    const jobs = this.one('SELECT COUNT(*) c FROM jobs WHERE user_id=? AND created_at>?', userId, since)?.c || 0;
+    const intents = this.one("SELECT COUNT(*) c FROM usage WHERE user_id=? AND kind='intent-model' AND created_at>?", userId, since)?.c || 0;
+    return Number(jobs) + Number(intents);
+  }
+  hourlyRulesIntents(userId) {
+    const since = now() - HOUR_MS;
+    return Number(this.one("SELECT COUNT(*) c FROM usage WHERE user_id=? AND kind='intent-rules' AND created_at>?", userId, since)?.c || 0);
+  }
+  logUsage(userId, kind) {
+    this.sql.exec('INSERT INTO usage(user_id,kind,created_at) VALUES(?,?,?)', userId, kind, now());
+  }
+  consumeRulesIntent(userId) {
+    if (this.hourlyRulesIntents(userId) >= RULES_INTENT_QUOTA) return { error: '意图判断过于频繁，请稍后再试' };
+    this.logUsage(userId, 'intent-rules');
+    return { ok: true };
+  }
 
   // ---------- 项目 ----------
   projectSummary(p) {
@@ -155,6 +213,9 @@ export class AppStore extends DurableObject {
     this.sql.exec('INSERT INTO messages(id,project_id,role,agent,content,meta,created_at) VALUES(?,?,?,?,?,?,?)', id, projectId, role, agent, String(content || ''), meta ? JSON.stringify(meta) : null, now());
     return id;
   }
+  updateMessage(id, content, meta) {
+    this.sql.exec('UPDATE messages SET content=?, meta=? WHERE id=?', String(content ?? ''), meta ? JSON.stringify(meta) : null, id);
+  }
   addVersion(projectId, { html, note, kind, mode, model, score, lane, candidate, jobId }) {
     const id = uid();
     const n = (this.one('SELECT COALESCE(MAX(n),0) m FROM versions WHERE project_id=?', projectId).m || 0) + 1;
@@ -175,8 +236,7 @@ export class AppStore extends DurableObject {
   createJob(projectId, userId, type) {
     const running = this.activeJob(projectId);
     if (running) return { error: '该项目已有任务在运行', job: running };
-    const recent = this.one("SELECT COUNT(*) c FROM jobs WHERE user_id=? AND created_at>?", userId, now() - 3600_000).c;
-    if (recent >= 30) return { error: '每小时最多 30 次生成，请稍后再试' };
+    if (this.hourlyModelUses(userId) >= MODEL_QUOTA) return { error: '每小时最多 30 次生成（含意图模型判断），请稍后再试' };
     const id = uid();
     this.sql.exec('INSERT INTO jobs(id,project_id,user_id,type,status,detail,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)', id, projectId, userId, type, 'running', '{}', now(), now());
     return { job: { id, status: 'running', type } };
@@ -197,7 +257,15 @@ export class AppStore extends DurableObject {
   getJob(id) {
     const j = this.one('SELECT * FROM jobs WHERE id=?', id);
     if (!j) return null;
-    if (j.status === 'running' && now() - j.updated_at > STALE_MS) { this.updateJob(id, 'failed', { error: '任务中断（超时无心跳）' }); j.status = 'failed'; }
+    if (j.status === 'running' && now() - j.updated_at > STALE_MS) {
+      const error = '任务中断（超时无心跳）';
+      this.updateJob(id, 'failed', { error });
+      j.status = 'failed';
+      try {
+        const prev = JSON.parse(j.detail || '{}') || {};
+        j.detail = JSON.stringify(prev && typeof prev === 'object' ? { ...prev, error } : { error });
+      } catch { j.detail = JSON.stringify({ error }); }
+    }
     return { id: j.id, projectId: j.project_id, userId: j.user_id, type: j.type, status: j.status, detail: JSON.parse(j.detail || '{}'), createdAt: j.created_at, updatedAt: j.updated_at };
   }
   activeJob(projectId) {
@@ -225,24 +293,38 @@ export class AppStore extends DurableObject {
     const job = this.getJob(j.id);
     if (!job || job.status !== 'done') return null;
     const d = job.detail || {};
-    if (d.needsRuntime && !d.runtimeChecked) return { id: job.id, type: job.type };
+    if (d.needsRuntime && !d.runtimeChecked && d.runtimeToken) return { id: job.id, type: job.type, token: d.runtimeToken };
     return null;
   }
-  applyRuntimeCheck(projectId, { jobId, reports }) {
+  findResultMessage(projectId, jobId, versionIds) {
+    const rows = this.q("SELECT id, agent, content, meta FROM messages WHERE project_id=? AND agent IN ('qa','editor') ORDER BY created_at DESC, rowid DESC LIMIT 40", projectId);
+    let byVersion = null;
+    for (const m of rows) {
+      let meta = null;
+      try { meta = m.meta ? JSON.parse(m.meta) : null; } catch { meta = null; }
+      if (!meta || typeof meta !== 'object') continue;
+      if (meta.jobId && meta.jobId === jobId) return { id: m.id, agent: m.agent, content: m.content, meta };
+      if (!byVersion && meta.versionId && versionIds.has(String(meta.versionId)) && !meta.runtime) byVersion = { id: m.id, agent: m.agent, content: m.content, meta };
+    }
+    return byVersion;
+  }
+  applyRuntimeCheck(projectId, { jobId, reports, runtimeToken }) {
     const job = this.getJob(jobId);
-    if (!job || job.projectId !== projectId) return { error: '任务不存在' };
-    if (job.detail?.runtimeChecked) return { ignored: true };
-    const list = (Array.isArray(reports) ? reports : []).slice(0, 8).map((r) => {
-      if (!r || !r.versionId || r.timeout) return null;
-      const errors = (Array.isArray(r.errors) ? r.errors : []).slice(0, 12).map((e) => ({
-        message: String((e && e.message) || '').trim().slice(0, 300),
-        line: e && e.line ? (e.line | 0) : 0,
-      })).filter((e) => e.message);
-      return { versionId: String(r.versionId), errors, blank: !!r.blank, textLen: r.textLen | 0, nodes: r.nodes | 0 };
-    }).filter(Boolean);
-    if (!list.length) return { inconclusive: true };
+    if (!job || job.projectId !== projectId) return { error: '任务不存在', status: 404 };
+    if (job.status !== 'done') return { error: '任务尚未完成', status: 409 };
+    if (job.detail?.runtimeChecked || job.detail?.runtimeTokenUsed) return { error: '运行时检查已提交', status: 409 };
+    const expected = typeof job.detail?.runtimeToken === 'string' ? job.detail.runtimeToken : '';
+    if (!expected) return { error: '缺少运行时检查凭证', status: 403 };
+    if (!timingSafeEqualStr(expected, String(runtimeToken ?? ''))) return { error: '运行时检查凭证无效', status: 403 };
     const versions = this.q('SELECT * FROM versions WHERE project_id=? AND job_id=? ORDER BY created_at ASC', projectId, jobId);
+    const checked = validateRuntimeReports(reports, { versionIds: versions.map((v) => v.id) });
+    if (!checked.ok) return { error: checked.error, status: 400 };
+    const list = checked.reports;
+    if (!list.length) return { inconclusive: true };
+    // 凭证一次性：校验通过后立即作废，重放返回 409
+    this.updateJob(jobId, null, { runtimeToken: '', runtimeTokenUsed: true });
     const byId = new Map(versions.map((v) => [v.id, v]));
+    const clamp100 = (n) => Math.max(0, Math.min(100, Math.round(Number(n) || 0)));
     const updated = [];
     for (const rep of list) {
       const v = byId.get(rep.versionId);
@@ -250,10 +332,15 @@ export class AppStore extends DurableObject {
       let prev = { total: v.score || 0, items: [], qa: { ok: true, issues: [] } };
       try { if (v.score_json) prev = JSON.parse(v.score_json); } catch {}
       const next = applyRuntime(prev, rep);
+      next.total = clamp100(next.total);
+      if (next.staticTotal != null) next.staticTotal = clamp100(next.staticTotal);
       this.sql.exec('UPDATE versions SET score=?, score_json=? WHERE id=?', next.total, JSON.stringify(next), v.id);
       updated.push({ row: { ...v, score_json: JSON.stringify(next) }, score: next });
     }
-    if (!updated.length) return { inconclusive: true };
+    if (!updated.length) {
+      this.updateJob(jobId, null, { runtimeChecked: true, needsRuntime: false });
+      return { inconclusive: true };
+    }
     const laneName = (id) => (LANE_VARIANTS.find((x) => x.id === id) || {}).name || '';
     const labelOf = (rt) => !rt ? '—' : rt.blank ? '⚪ 白屏' : rt.errorCount > 0 ? `❌ ${rt.errorCount} 个错误` : '✅';
     const proj = this.getProjectRow(projectId);
@@ -284,31 +371,55 @@ export class AppStore extends DurableObject {
       ms: 0,
       error: u.score.runtime.clean ? null : (u.score.runtime.blank ? '白屏' : (u.score.runtime.errors[0]?.message || '运行时错误')),
     }));
+    const candidates = isEdit ? [] : updated.filter((u) => u.row.candidate && u.row.lane !== winLane).map((u) => ({ id: u.row.id, lane: u.row.lane, name: laneName(u.row.lane), score: u.score.total }));
+    const prevMsg = this.findResultMessage(projectId, jobId, new Set(versions.map((v) => v.id)));
+    const isFallback = !!(prevMsg?.meta?.fallback) || versions.some((v) => v.kind === 'fallback');
+    const wasRace = !!(prevMsg && String(prevMsg.content || '').includes('赛马结果')) || (!isEdit && !isFallback && updated.length > 1);
+    const appendPass = (base) => {
+      const t = String(base || '').trim();
+      if (!t) return '运行时检查通过。';
+      if (t.includes('运行时检查通过')) return t;
+      return t.replace(/。?$/, '。') + '运行时检查通过。';
+    };
+    const appendFail = (base, sentence) => {
+      const t = String(base || '').replace(/运行时检查未通过：.*$/, '').trim();
+      return (t ? t.replace(/。?$/, '。') : '') + sentence;
+    };
     let content = '';
-    if (isEdit) {
-      if (winnerDirty) {
-        const rt = winner.score.runtime;
-        content = rt.blank ? '运行时检查未通过：页面白屏。可在预览里点「让 AI 修复」。' : `运行时检查未通过：${rt.errorCount} 个错误。可在预览里点「让 AI 修复」。`;
-      }
+    if (isEdit || isFallback) {
+      const base = prevMsg?.content || (isEdit ? '已完成修改。' : '已使用内置模板。');
+      const rt = winner?.score.runtime;
+      if (!winnerDirty || !rt) content = appendPass(base);
+      else if (rt.blank) content = appendFail(base, '运行时检查未通过：页面白屏。可在预览里点「让 AI 修复」。');
+      else content = appendFail(base, `运行时检查未通过：${rt.errorCount} 个错误。可在预览里点「让 AI 修复」。`);
     } else if (switched) {
-      content = `${note}（最终 ${clean[0].score.total} 分）。`;
+      const wLane = winner.row.lane || 'A';
+      const bLane = clean[0].row.lane || 'B';
+      const rt = winner.score.runtime;
+      const problem = rt.blank ? '运行时白屏' : `运行时报 ${rt.errorCount} 个错误`;
+      content = `赛马结果：方案 ${bLane} 以 ${clean[0].score.total} 分胜出（方案 ${wLane} 静态 ${winner.score.staticTotal} 分领先，但${problem}，已自动改用方案 ${bLane}）`;
     } else if (updated.every((u) => !u.score.runtime.clean)) {
       content = `运行时检查：全部方案都有运行时问题。已保留当前方案${winLane ? ' ' + winLane : ''}，可在预览里点「让 AI 修复」。`;
     } else if (winnerDirty) {
       content = `运行时检查：当前方案存在运行时问题，其他方案分数未超过它，暂时保留。可在预览里点「让 AI 修复」。`;
+    } else if (wasRace) {
+      const name = laneName(winLane);
+      const extra = candidates.length ? '，其余方案已保留为候选，可一键切换' : '';
+      content = `赛马结果：方案 ${winLane}${name ? '（' + name + '）' : ''}以 ${winner.score.total} 分胜出${extra}。运行时检查通过。`;
     } else {
-      content = `运行时检查通过${winLane ? '：方案 ' + winLane + ' 无报错' : ''}（最终 ${winner.score.total} 分）。`;
+      content = appendPass(prevMsg?.content || `QA 通过，综合评分 ${winner.score.total} 分。`);
     }
-    if (content) {
-      const meta = {
-        runtime: true,
-        board,
-        winner: winLane || null,
-        versionId: newVersionId || winner?.row.id || null,
-        candidates: isEdit ? [] : updated.filter((u) => u.row.candidate && u.row.lane !== winLane).map((u) => ({ id: u.row.id, lane: u.row.lane, name: laneName(u.row.lane), score: u.score.total })),
-      };
-      this.addMessage(projectId, 'agent', 'qa', content, meta);
-    }
+    const meta = {
+      ...(prevMsg?.meta || {}),
+      runtime: true,
+      jobId,
+      board,
+      winner: winLane || null,
+      versionId: newVersionId || winner?.row.id || prevMsg?.meta?.versionId || null,
+      candidates,
+    };
+    if (prevMsg) this.updateMessage(prevMsg.id, content, meta);
+    else this.addMessage(projectId, 'agent', isEdit ? 'editor' : 'qa', content, meta);
     this.updateJob(jobId, null, { runtimeChecked: true, needsRuntime: false });
     return { ok: true, switched, versionId: newVersionId || null };
   }

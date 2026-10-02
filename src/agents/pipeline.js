@@ -1,5 +1,5 @@
 // 多智能体流水线：Planner → Engineer×N（赛马）→ QA/Judge；以及 Editor（增量补丁迭代）
-import { resilientChat, CanceledError, StoppedError } from './llm.js';
+import { resilientChat, CanceledError, StoppedError, friendlyError } from './llm.js';
 import { channelsFor, laneModelId } from './models.js';
 import { PLANNER_SYSTEM, LANE_VARIANTS, engineerSystem, engineerUser, EDITOR_SYSTEM, editorUser, editorRepair } from './prompts.js';
 import { extractHtml, parseLooseJson, injectRuntimeFault } from '../lib/html.js';
@@ -75,8 +75,8 @@ export async function runGenerate(ctx, { prompt, lanes = 2 }) {
       emit('lane', { lane: 'P', status: 'done', chars: (r.text || '').length || planChars, tail: (r.text || '').slice(-400) });
     } catch (e) {
       if (e instanceof CanceledError) throw e;
-      emit('lane', { lane: 'P', status: 'failed', error: e.message, chars: planChars });
-      emit('log', { agent: 'planner', level: 'warn', text: '规划模型不可用，改用规则拆解：' + e.message });
+      emit('lane', { lane: 'P', status: 'failed', error: friendlyError(e), chars: planChars });
+      emit('log', { agent: 'planner', level: 'warn', text: '规划模型不可用，改用规则拆解：' + friendlyError(e) });
     }
   } else {
     emit('lane', { lane: 'P', name: '需求拆解', status: 'done', chars: 0, model: 'rules' });
@@ -129,8 +129,9 @@ export async function runGenerate(ctx, { prompt, lanes = 2 }) {
     } catch (e) {
       if (e instanceof CanceledError) throw e;
       const stopped = e instanceof StoppedError || e?.kind === 'stopped';
-      emit('lane', { lane: v.id, status: stopped ? 'stopped' : 'failed', error: e.message, ms: Date.now() - t0 });
-      return { v, ok: false, error: e.message, stopped };
+      const shown = stopped ? (e.message || '已提前结束') : friendlyError(e);
+      emit('lane', { lane: v.id, status: stopped ? 'stopped' : 'failed', error: shown, ms: Date.now() - t0 });
+      return { v, ok: false, error: shown, stopped };
     }
   }).map((p, i) => p.finally(() => stoppers[i].dispose())));
   clearTimeout(graceTimer);
@@ -149,7 +150,7 @@ export async function runGenerate(ctx, { prompt, lanes = 2 }) {
     }
     const board = results.map((r) => ({ lane: r.v.id, name: r.v.name, ok: r.ok, score: r.score?.total ?? 0, staticScore: r.score?.total ?? 0, finalScore: r.score?.total ?? 0, runtimeLabel: r.ok ? '待检查' : '—', items: r.score?.items || [], model: r.model ? short(r.model) : '-', channel: r.channel || '-', ms: r.ms || 0, error: r.error }));
     await say('qa', n > 1 ? `赛马结果：方案 ${win.v.id}（${win.v.name}）以 ${win.score.total} 分胜出${candidates.length ? '，其余方案已保留为候选，可一键切换' : ''}。` : `QA 通过，综合评分 ${win.score.total} 分。`,
-      { versionId: vid, board, winner: win.v.id, candidates, mode });
+      { versionId: vid, board, winner: win.v.id, candidates, mode, jobId });
     return { status: 'done', versionId: vid, mode };
   }
 
@@ -157,7 +158,7 @@ export async function runGenerate(ctx, { prompt, lanes = 2 }) {
   const fb = fallbackVersion(prompt);
   const reason = demo ? '演示模式（未调用模型）' : `模型通道全部失败（${results.map((r) => `${r.v.id}: ${r.error}`).join(' | ').slice(0, 300)}）`;
   const vid = await store.addVersion(projectId, { html: fb.html, note: `演示模式：内置「${fb.name}」模板`, kind: 'fallback', mode: 'demo', model: 'template', score: scoreHtml(fb.html, plan.features), jobId });
-  await say('qa', `⚠️ ${reason}。已自动降级为内置「${fb.name}」模板，生成了一个可完整使用的应用（演示模式）。模型恢复后可重新生成或继续对话修改。`, { versionId: vid, mode: 'demo', fallback: true });
+  await say('qa', `⚠️ ${reason}。已自动降级为内置「${fb.name}」模板，生成了一个可完整使用的应用（演示模式）。模型恢复后可重新生成或继续对话修改。`, { versionId: vid, mode: 'demo', fallback: true, jobId });
   return { status: 'done', versionId: vid, mode: 'demo' };
 }
 
@@ -188,7 +189,7 @@ export async function runEdit(ctx, { request, baseVersionId }) {
     const r = demoEdit(original, request);
     if (r.changes.length && qaCheck(r.html).ok) {
       const { vid } = await commit(r.html, `规则修改：${r.changes.join('、')}`, 'demo', 'rules');
-      await say('editor', `${why ? `⚠️ ${why}。` : ''}已在演示模式下通过规则引擎完成修改：${r.changes.join('、')}。`, { versionId: vid, mode: 'demo' });
+      await say('editor', `${why ? `⚠️ ${why}。` : ''}已在演示模式下通过规则引擎完成修改：${r.changes.join('、')}。`, { versionId: vid, mode: 'demo', jobId });
       return { status: 'done', versionId: vid, mode: 'demo' };
     }
     await say('editor', `${why ? `⚠️ ${why}。` : ''}演示模式仅支持「换主色 / 深浅色主题 / 改标题 / 放大字号 / 圆角」类修改，这条需求未能处理，已保留当前版本（v${base.n}）不变。`, { mode: 'demo', kept: base.id });
@@ -254,7 +255,7 @@ export async function runEdit(ctx, { request, baseVersionId }) {
       }
       let out;
       try { out = await attempt(i === 0 ? chs : [chs[i]]); }
-      catch (e) { if (e instanceof CanceledError) throw e; if (i === 0) throw e; why = e.message; break; }
+      catch (e) { if (e instanceof CanceledError) throw e; if (i === 0) throw e; why = friendlyError(e); break; }
       emit('stage', { stage: 'qa', text: '正在应用补丁并做静态检查…' });
       why = verdict(out);
       if (!why) ok = out;
@@ -270,11 +271,11 @@ export async function runEdit(ctx, { request, baseVersionId }) {
     emit('lane', { lane: 'E', status: 'done', chars: editChars, model: short(r.model) });
     const { vid, score } = await commit(html, `修改：${request.slice(0, 40)}`, mode, short(r.model));
     const delta = html.length - original.length;
-    await say('editor', `已应用 ${applied} 处增量修改（${delta >= 0 ? '+' : ''}${delta} 字符，模型 ${short(r.model)}），QA 通过，评分 ${score.total}。`, { versionId: vid, mode, applied });
+    await say('editor', `已应用 ${applied} 处增量修改（${delta >= 0 ? '+' : ''}${delta} 字符，模型 ${short(r.model)}），QA 通过，评分 ${score.total}。`, { versionId: vid, mode, applied, jobId });
     return { status: 'done', versionId: vid, mode };
   } catch (e) {
     if (e instanceof CanceledError) throw e;
-    return tryDemo(`模型不可用（${e.message}），已降级`);
+    return tryDemo(`模型不可用（${friendlyError(e)}），已降级`);
   } finally {
     stopper.dispose();
   }

@@ -1,6 +1,6 @@
 // Atoms Demo —— Cloudflare Worker 入口：静态资源 + REST/流式 API + 分享页
 import { AppStore } from './store.js';
-import { hashPassword, verifyPassword, newToken, validateCredentials } from './lib/auth.js';
+import { hashPassword, verifyPassword, newToken, validateCredentials, loginLockDecision, needsRehash, DUMMY_LOGIN } from './lib/auth.js';
 import { catalog, channelsFor } from './agents/models.js';
 import { resilientChat } from './agents/llm.js';
 import { injectShim } from '../public/shim.js';
@@ -9,8 +9,16 @@ import { classifyIntent } from './lib/intent.js';
 
 export { AppStore };
 
-const json = (data, status = 200) => new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
+const SECURITY = {
+  'x-content-type-options': 'nosniff',
+  'referrer-policy': 'strict-origin-when-cross-origin',
+  'x-frame-options': 'DENY',
+  'permissions-policy': 'camera=(), microphone=(), geolocation=()',
+};
+const json = (data, status = 200) => new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', ...SECURITY } });
 const err = (message, status = 400) => json({ error: message }, status);
+const shortId = () => [...crypto.getRandomValues(new Uint8Array(4))].map((b) => b.toString(16).padStart(2, '0')).join('');
+const LOGIN_LOCK_MSG = '登录失败次数过多，请 15 分钟后再试';
 const db = (env) => env.STORE.get(env.STORE.idFromName('global'));
 
 async function readJson(req) { try { return await req.json(); } catch { return {}; } }
@@ -48,8 +56,37 @@ route('POST', '/api/auth/register', async (req, env, { user }) => {
 route('POST', '/api/auth/login', async (req, env) => {
   const { username, password } = await readJson(req);
   if (!username || !password) return err('请输入用户名和密码');
-  const u = await db(env).getUserByName(String(username));
-  if (!u || !u.pass_hash || !(await verifyPassword(String(password), u.pass_hash, u.salt))) return err('用户名或密码错误', 401);
+  const name = String(username).slice(0, 64);
+  const ip = req.headers.get('cf-connecting-ip') || '';
+  const store = db(env);
+  const userKey = 'u:' + name;
+  const ipKey = ip ? 'ip:' + ip.slice(0, 80) : '';
+  const uf = await store.authFailState(userKey);
+  const ipf = ipKey ? await store.authFailState(ipKey) : { count: 0, firstAt: 0 };
+  const decision = loginLockDecision({ userFails: uf.count, userFirstAt: uf.firstAt, ipFails: ipf.count, ipFirstAt: ipf.firstAt, now: Date.now() });
+  if (decision.locked) return err(LOGIN_LOCK_MSG, 429);
+  const u = await store.getUserByName(name);
+  let ok = false;
+  try {
+    if (!u || !u.pass_hash || !u.salt) {
+      await verifyPassword(String(password), DUMMY_LOGIN.hash, DUMMY_LOGIN.salt);
+    } else {
+      ok = await verifyPassword(String(password), u.pass_hash, u.salt);
+      if (ok && needsRehash(u.pass_hash)) {
+        const next = await hashPassword(String(password));
+        await store.updatePassword(u.id, next.hash, next.salt);
+      }
+    }
+  } catch (e) {
+    console.error('login verify', e);
+    ok = false;
+  }
+  if (!ok) {
+    await store.recordAuthFail(userKey);
+    if (ipKey) await store.recordAuthFail(ipKey);
+    return err('用户名或密码错误', 401);
+  }
+  await store.clearAuthFail(userKey);
   return json(await issueSession(env, { id: u.id, username: u.username, isGuest: false }));
 });
 
@@ -95,6 +132,7 @@ route('GET', '/api/projects/:id', async (req, env, { user, params }) => {
   const r = await loadOwned(env, user, params.id, { allowPublic: true });
   if (r.error) return r.error;
   const data = await db(env).getProject(params.id);
+  if (data && !r.owner) data.pendingRuntime = null;
   return json({ ...data, isOwner: r.owner });
 });
 
@@ -142,9 +180,15 @@ route('POST', '/api/projects/:id/intent', async (req, env, { user, params }) => 
   if (!text) return err('请输入内容');
   if (text.length > 2000) return err('输入请控制在 2000 字以内');
   const ctx = await db(env).projectContext(params.id) || { title: r.row.title, prompt: r.row.prompt };
+  const store = db(env);
   let result = { ...classifyIntent(text, ctx), source: 'rules' };
   const configured = env.AI_DISABLED !== '1' && env.ANTHROPIC_AUTH_TOKEN && env.ANTHROPIC_BASE_URL;
-  if (result.intent === 'unsure' && configured) {
+  const callModel = result.intent === 'unsure' && !!configured;
+  if (callModel) {
+    // 额度用尽时不打模型、也不要报错：保持规则的 unsure，前端会弹出选择
+    const used = await store.hourlyModelUses(user.id);
+    if (used >= 30) return json(result);
+    await store.logUsage(user.id, 'intent-model');
     let settled = false;
     try {
       const intent = await Promise.race([
@@ -153,7 +197,10 @@ route('POST', '/api/projects/:id/intent', async (req, env, { user, params }) => 
       ]);
       if (intent === 'new' || intent === 'edit') result = { intent, confidence: 0.86, reason: (result.reason ? result.reason + '；' : '') + '模型判别', source: 'model' };
     } catch { /* 保持规则给出的 unsure */ }
+    return json(result);
   }
+  const gate = await store.consumeRulesIntent(user.id);
+  if (gate.error) return err(gate.error, 429);
   return json(result);
 }, { auth: true });
 
@@ -163,8 +210,8 @@ route('POST', '/api/projects/:id/runtime-check', async (req, env, { user, params
   const body = await readJson(req);
   const job = await db(env).getJob(String(body.jobId || ''));
   if (!job || job.userId !== user.id || job.projectId !== params.id) return err('任务不存在', 404);
-  const out = await db(env).applyRuntimeCheck(params.id, { jobId: job.id, reports: body.reports });
-  if (out.error) return err(out.error, 400);
+  const out = await db(env).applyRuntimeCheck(params.id, { jobId: job.id, reports: body.reports, runtimeToken: body.runtimeToken });
+  if (out.error) return err(out.error, out.status || 400);
   return json(out);
 }, { auth: true });
 
@@ -217,11 +264,28 @@ route('POST', '/api/projects/:id/run', async (req, env, { user, params }) => {
   return db(env).fetch('https://store/run', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ projectId: params.id, userId: user.id, body: { ...body, type, prompt: text } }) });
 }, { auth: true });
 
-// 分享页：独立页面运行生成的应用（CSP sandbox 隔离，无法访问本站登录态）
+const SHARE_MISS = '作品不存在或未公开';
+function shareMiss() {
+  return new Response(SHARE_MISS, { status: 404, headers: {
+    'content-type': 'text/plain; charset=utf-8',
+    'cache-control': 'no-store',
+    'x-content-type-options': 'nosniff',
+    'referrer-policy': 'strict-origin-when-cross-origin',
+  } });
+}
+
+// 分享页：独立页面运行生成的应用（CSP sandbox 隔离，无法访问本站登录态）。
+// 不设 X-Frame-Options，避免和 sandbox CSP 打架；未公开与不存在返回同一句，避免探测。
 async function sharePage(env, id) {
   const store = db(env);
   const row = await store.getProjectRow(id);
-  if (!row || !row.current_version_id) return new Response('作品不存在或尚未生成', { status: 404, headers: { 'content-type': 'text/plain; charset=utf-8' } });
+  if (!row || !row.is_public) return shareMiss();
+  if (!row.current_version_id) return new Response('作品不存在或尚未生成', { status: 404, headers: {
+    'content-type': 'text/plain; charset=utf-8',
+    'cache-control': 'no-store',
+    'x-content-type-options': 'nosniff',
+    'referrer-policy': 'strict-origin-when-cross-origin',
+  } });
   const v = await store.getVersion(row.current_version_id);
   const badge = `<a href="/#/p/${escapeHtml(id)}" target="_blank" style="position:fixed;right:12px;bottom:12px;z-index:2147483647;background:#111827;color:#fff;font:12px/1.2 sans-serif;padding:7px 10px;border-radius:999px;text-decoration:none;opacity:.85">⚛ Made with Atoms Demo</a>`;
   let html = injectShim(v.html, { storageKey: id, bridge: false });
@@ -231,6 +295,8 @@ async function sharePage(env, id) {
     'content-type': 'text/html; charset=utf-8',
     'content-security-policy': "sandbox allow-scripts allow-forms allow-modals allow-popups allow-downloads",
     'cache-control': 'no-store',
+    'x-content-type-options': 'nosniff',
+    'referrer-policy': 'strict-origin-when-cross-origin',
   } });
 }
 
@@ -238,9 +304,9 @@ export default {
   async fetch(req, env, ctx) {
     const url = new URL(req.url);
     const path = url.pathname;
-    if (path.startsWith('/s/')) return sharePage(env, decodeURIComponent(path.slice(3)));
-    if (!path.startsWith('/api/')) return env.ASSETS.fetch(req);
     try {
+      if (path.startsWith('/s/')) return sharePage(env, decodeURIComponent(path.slice(3)));
+      if (!path.startsWith('/api/')) return env.ASSETS.fetch(req);
       for (const r of routes) {
         if (r.method !== req.method) continue;
         const m = path.match(r.re);
@@ -251,8 +317,16 @@ export default {
       }
       return err('接口不存在', 404);
     } catch (e) {
-      console.error('api error', e?.stack || e);
-      return err('服务器开小差了：' + String(e?.message || e), 500);
+      const id = shortId();
+      console.error('api error', id, e?.stack || e);
+      const message = `服务器开小差了，请稍后重试（编号 ${id}）`;
+      if (path.startsWith('/api/')) return err(message, 500);
+      return new Response(message, { status: 500, headers: {
+        'content-type': 'text/plain; charset=utf-8',
+        'cache-control': 'no-store',
+        'x-content-type-options': 'nosniff',
+        'referrer-policy': 'strict-origin-when-cross-origin',
+      } });
     }
   },
 };

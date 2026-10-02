@@ -1,0 +1,10 @@
+# 静态资源响应头。主站 CSP 允许 unsafe-inline：srcdoc 预览 / 探针 / 缩略图会继承本文档的 CSP，
+# 生成应用里的内联脚本和样式必须能跑。隔离靠 iframe sandbox（无 allow-same-origin），不靠收紧 script-src。
+# 无头 Chrome 实测：frame-src / form-action 不包含 about: 时，srcdoc 内联脚本、preventDefault 表单、
+# alert/confirm、blob 下载链接和 window.open 仍可用，因此不放宽到 about:。
+/*
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: strict-origin-when-cross-origin
+  X-Frame-Options: DENY
+  Permissions-Policy: camera=(), microphone=(), geolocation=()
+  Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; frame-src 'self' blob: data:; worker-src 'self' blob:; media-src 'self' data: blob:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'

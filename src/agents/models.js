@@ -11,14 +11,17 @@ export const resolveChoice = (c) => (CHOICES.includes(c) ? c : 'deepseek');
 
 const short = (m) => String(m || '').split('/').pop();
 
-/** 主模型 + 另一模型作备用通道 */
+/** 主模型 + 另一模型作备用通道。备用通道仅当两个备用 Secret 都配置时才改用它们，否则与主通道同一套地址和密钥。 */
 export function channelsFor(env, id, { attempts = 3, backupAttempts = 2 } = {}) {
   const list = catalog(env);
   const main = list.find((m) => m.id === id) || list[0];
   const other = list.find((m) => m.id !== main.id);
+  const backupBase = String(env?.ANTHROPIC_BACKUP_BASE_URL || '').trim();
+  const backupToken = String(env?.ANTHROPIC_BACKUP_AUTH_TOKEN || '').trim();
+  const backup = backupBase && backupToken ? { baseUrl: backupBase, authToken: backupToken } : {};
   return [
     { model: main.model, label: `主模型 ${short(main.model)}`, attempts },
-    { model: other.model, label: `备用模型 ${short(other.model)}`, attempts: backupAttempts },
+    { model: other.model, label: `备用模型 ${short(other.model)}`, attempts: backupAttempts, ...backup },
   ];
 }
 

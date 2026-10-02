@@ -2,9 +2,17 @@
 import { runGenerate, runEdit } from './agents/pipeline.js';
 import { CanceledError } from './agents/llm.js';
 import { resolveChoice } from './agents/models.js';
+import { newToken } from './lib/auth.js';
+
+const apiHeaders = {
+  'x-content-type-options': 'nosniff',
+  'referrer-policy': 'strict-origin-when-cross-origin',
+  'x-frame-options': 'DENY',
+  'permissions-policy': 'camera=(), microphone=(), geolocation=()',
+};
 
 export function startRun(env, store, { projectId, userId, body }) {
-  const json = (data, status) => new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json; charset=utf-8' } });
+  const json = (data, status) => new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', ...apiHeaders } });
   const row = store.getProjectRow(projectId);
   if (!row || row.user_id !== userId) return json({ error: '无权访问该项目' }, 403);
   const type = body.type;
@@ -80,9 +88,16 @@ export function startRun(env, store, { projectId, userId, body }) {
     try {
       result = type === 'edit' ? await runEdit(jctx, { request: text, baseVersionId: body.baseVersionId || row.current_version_id }) : await runGenerate(jctx, { prompt: text, lanes: body.lanes ?? 2 });
       const status = result.status === 'done' ? 'done' : result.status;
-      store.updateJob(jobId, status, { result, needsRuntime: status === 'done' });
+      let runtimeToken = null;
+      if (status === 'done') {
+        runtimeToken = newToken();
+        store.updateJob(jobId, status, { result, needsRuntime: true, runtimeToken });
+        result = { ...result, runtimeToken };
+      } else {
+        store.updateJob(jobId, status, { result });
+      }
     } catch (e) {
-      // 异常绝不穿透：取消 / 未知错误都转成可展示的状态
+      // 异常绝不穿透：取消 / 未知错误都转成可展示的状态。原始错误只留在服务端日志。
       if (e instanceof CanceledError) {
         result = { status: 'canceled' };
         store.updateJob(jobId, 'canceled', { result });
@@ -90,10 +105,12 @@ export function startRun(env, store, { projectId, userId, body }) {
         const mid = store.addMessage(projectId, 'agent', 'system', content);
         emit('message', { id: mid, role: 'agent', agent: 'system', content });
       } else {
-        console.error('job failed', e?.stack || e);
-        result = { status: 'failed', error: String(e?.message || e) };
-        store.updateJob(jobId, 'failed', { result });
-        const content = `任务异常：${result.error}。已有版本不受影响，可重试。`;
+        const id = newToken().slice(0, 8);
+        console.error('job failed', id, e?.stack || e);
+        const friendly = `任务异常，请稍后重试（编号 ${id}）`;
+        result = { status: 'failed', error: friendly };
+        store.updateJob(jobId, 'failed', { result, error: friendly });
+        const content = `${friendly}。已有版本不受影响，可重试。`;
         const mid = store.addMessage(projectId, 'agent', 'system', content);
         emit('message', { id: mid, role: 'agent', agent: 'system', content });
       }
@@ -104,5 +121,5 @@ export function startRun(env, store, { projectId, userId, body }) {
       try { await writer.close(); } catch {}
     }
   })();
-  return new Response(readable, { headers: { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-store', 'x-accel-buffering': 'no' } });
+  return new Response(readable, { headers: { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-store', 'x-accel-buffering': 'no', ...apiHeaders } });
 }
